@@ -1,1 +1,1 @@
-# Code---Perks-and-Pitfalls-of-Continual-Learning-in-Financial-Fraud-Detection
+# thesis-continual-learning-fraud-detection
