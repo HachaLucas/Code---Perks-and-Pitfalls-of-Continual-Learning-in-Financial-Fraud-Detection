@@ -10,9 +10,7 @@ import pandas as pd
 import scipy.stats as stats
 
 SEED = 42
-DELTAS_AXIS1 = [0.30, 0.60, 0.90, 1.20, 1.50]
-DELTAS_AXIS2 = [0.30, 0.60, 0.90, 1.20, 1.50]
-OUT_DIR = r"C:\Users\julie\OneDrive\Documenten\Thesis\simplification dataset output"
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +41,6 @@ class GeneratorConfig:
 
     # Remote channel
     remote_marginal_p:        float = 0.36
-    remote_fraud_lift:        float = 0.4
 
     # Fraud model — intercept auto-calibrated at runtime for ~1% fraud rate
     fraud_intercept:          float = -9.3272
@@ -95,7 +92,6 @@ class CustomerHistory:
 
         log_amts = np.log(np.clip(self.amounts, 1e-6, None))
         z        = (np.log(max(amount, 1e-6)) - log_amts.mean()) / max(log_amts.std(), 0.25)
-        mean_amt = float(np.mean(self.amounts))
 
         # is_foreign: rolling window novelty; treat a transaction as foreign if the country
         # has not been seen recently.
@@ -251,8 +247,8 @@ def _sample_countries(cfg: GeneratorConfig, home_idx: int, n: int,
 
 def _run_warmup(profiles: list, histories: Dict[int, CustomerHistory],
                 cfg: GeneratorConfig, rng: np.random.Generator):
-    for w in range(cfg.n_warmup_periods):
-        start = -(cfg.n_warmup_periods - w) * cfg.period_duration_hours
+    for i in range(cfg.n_warmup_periods):
+        start = -(cfg.n_warmup_periods - i) * cfg.period_duration_hours
         for prof in profiles:
             n    = max(1, int(rng.poisson(cfg.txns_per_customer_lambda)))
             ts   = _sample_arrival_times(n, prof["time_peak_hr"], cfg.time_kappa,
@@ -322,6 +318,14 @@ def _generate_one_period(cfg: GeneratorConfig, histories: Dict[int, CustomerHist
 # Public API
 # ---------------------------------------------------------------------------
 
+def _print_summary(df: pd.DataFrame):
+    n, nf = len(df), int(df["is_fraud"].sum())
+    print(f"\n{'='*55}")
+    print(f"  n={n:,}  fraud={nf/n*100:.2f}%  amt=EUR{df['amount'].mean():.2f}"
+          f"  remote={df['is_remote'].mean()*100:.1f}%  avg_P={df['fraud_score'].mean():.4f}")
+    print(f"{'='*55}\n")
+
+
 def generate(cfg: Optional[GeneratorConfig] = None, seed: int = 42,
              verbose: bool = True) -> pd.DataFrame:
     """Generate a single stationary period with warmup."""
@@ -332,7 +336,7 @@ def generate(cfg: Optional[GeneratorConfig] = None, seed: int = 42,
     _run_warmup(profiles, histories, cfg, rng)
     df = _generate_one_period(cfg, histories, profiles, 0.0, 0, 1, rng).drop(columns=["period"])
     if verbose:
-        _print_summary(df, cfg)
+        _print_summary(df)
     return df
 
 
@@ -365,6 +369,8 @@ def generate_multiperiod(n_periods: int = 10,
 
     for p, pcfg in enumerate(cfg_list, start=1):
         period_start = (p - 1) * base.period_duration_hours
+        # Each period gets its own RNG derived from the parent, keeping periods
+        # independently reproducible while the overall sequence stays deterministic.
         df_p = _generate_one_period(pcfg, histories, profiles,
                                     period_start, txn_id, p,
                                     np.random.default_rng(rng.integers(0, 2**31)))
@@ -419,19 +425,14 @@ def check_calibration(cfg: Optional[GeneratorConfig] = None,
     return result
 
 
-def _print_summary(df: pd.DataFrame, cfg: GeneratorConfig):
-    n, nf = len(df), int(df["is_fraud"].sum())
-    print(f"\n{'='*55}")
-    print(f"  n={n:,}  fraud={nf/n*100:.2f}%  amt=EUR{df['amount'].mean():.2f}"
-          f"  remote={df['is_remote'].mean()*100:.1f}%  avg_P={df['fraud_score'].mean():.4f}")
-    print(f"{'='*55}\n")
-
-
 # ---------------------------------------------------------------------------
 # Drift experiment helpers
 # ---------------------------------------------------------------------------
 
 def _build_probe_matrix(cfg: GeneratorConfig, seed: int, n_probe_customers: int = 2000) -> pd.DataFrame:
+    """Run one warmup + one period for a small probe population and return the
+    pre-computed feature matrix. Used by the binary-search calibration routines
+    so weights can be evaluated cheaply without re-running warmup each iteration."""
     rng = np.random.default_rng(seed)
     probe_cfg = replace(cfg, n_customers=n_probe_customers)
 
@@ -549,7 +550,9 @@ def _calibrate_intermediate_weights(
     seed: int,
     target_rate: float = 0.01,
 ) -> GeneratorConfig:
-
+    """Scale all feature weights of an interpolated config by a single multiplier m
+    (found via binary search) so that mean P(fraud) ≈ target_rate with the
+    intercept held fixed. Zero weights stay zero because 0 * m = 0."""
     probe = _build_probe_matrix(cfg_candidate, seed)
 
     fields = [
@@ -603,6 +606,12 @@ def _calibrate_intermediate_weights(
     return best_cfg
 
 def _build_axis12_endpoints(seed: int) -> tuple[GeneratorConfig, GeneratorConfig]:
+    """Build the two endpoint configs used by Axis 1 and Axis 2.
+
+    Pattern A: fraud driven by remote channel and night-time hour.
+    Pattern B: fraud driven by foreign country and high velocity.
+    Both are calibrated to ~1% fraud rate using the same intercept.
+    """
     pattern_A = calibrate_intercept(replace(GeneratorConfig(),
         w_amount=1.50,
         w_night=3.00,
@@ -756,6 +765,9 @@ def run_baseline(seed: int = SEED) -> None:
 # Axis 1 — Drift Magnitude
 # ---------------------------------------------------------------------------
 
+DELTAS_AXIS1 = [0.30, 0.60, 0.90, 1.20, 1.50]
+
+
 def run_axis1(deltas: List[float] = DELTAS_AXIS1, seed: int = SEED) -> None:
     """Axis 1 — Drift Magnitude: sudden drift across 5 delta values.
 
@@ -767,12 +779,12 @@ def run_axis1(deltas: List[float] = DELTAS_AXIS1, seed: int = SEED) -> None:
     base = pattern_A
     for delta in deltas:
         cfg_list = _build_cfg_list_axis12(
-    pattern_A=pattern_A,
-    pattern_B=pattern_B,
-    d=delta,
-    speed="sudden",
-    seed=seed,
-)
+            pattern_A=pattern_A,
+            pattern_B=pattern_B,
+            d=delta,
+            speed="sudden",
+            seed=seed,
+        )
         label = f"axis1_delta{delta}_sudden"
         print(f"\n{'='*60}\nAxis 1 — delta={delta}  sudden\n{'='*60}")
         df = generate_multiperiod(cfg_list=cfg_list, cfg=base, seed=seed,
@@ -788,6 +800,9 @@ def run_axis1(deltas: List[float] = DELTAS_AXIS1, seed: int = SEED) -> None:
 # ---------------------------------------------------------------------------
 # Axis 2 — Drift Speed
 # ---------------------------------------------------------------------------
+
+DELTAS_AXIS2 = [0.30, 0.60, 0.90, 1.20, 1.50]
+
 
 def run_axis2(deltas: List[float] = DELTAS_AXIS2, seed: int = SEED) -> None:
     """Axis 2 — Gradual Drift: gradual A→B drift across the same delta values.
@@ -844,8 +859,6 @@ FREEZE_DURATIONS = [1, 2, 3, 4, 5, 6]
 
 
 def run_axis3(freeze_durations: List[int] = FREEZE_DURATIONS, seed: int = SEED) -> None:
-
-
     n_total = 10  # 3 baseline + up to 6 frozen + at least 1 recovery = 10
     n_baseline = 3
     for k in freeze_durations:
