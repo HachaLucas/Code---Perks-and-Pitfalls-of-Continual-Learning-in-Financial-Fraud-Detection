@@ -1,57 +1,72 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-from dataclasses import dataclass, field
+import json
+import os
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional
 
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
 
-# =============================================================================
-# SECTION 0 - Configuration
-# =============================================================================
+SEED = 42
+DELTAS_AXIS1 = [0.30, 0.60, 0.90, 1.20, 1.50]
+DELTAS_AXIS2 = [0.30, 0.60, 0.90, 1.20, 1.50]
+OUT_DIR = r"C:\Users\julie\OneDrive\Documenten\Thesis\simplification dataset output"
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class GeneratorConfig:
-
-    n_customers: int = 10000
+    # Population
+    n_customers:              int   = 1000
     txns_per_customer_lambda: float = 10.0
-    amount_mu_global:       float = 2.95
-    amount_sigma:           float = 1.2    
-    amount_mu_personal_std: float = 0.4
-    time_peak_hour:       float = 13.0
-    time_kappa:           float = 1.5   
-    time_personal_std_hr: float = 3.0   
-    countries:            List[str]   = field(default_factory=lambda: ["A", "B", "C"])
-    country_probs:        List[float] = field(default_factory=lambda: [0.85, 0.08, 0.07])
-    home_country_loyalty: float = 0.88  
-    remote_marginal_p:     float = 0.36
-    remote_fraud_lift:     float = 0.4
-    fraud_intercept: float = -13.8  # recalibrated: interactions raise avg logit ~1.3
-    w_amount:       float = 0.7
-    w_night:        float = 0.6
-    w_foreign:      float = 1.3
-    w_new_country:  float = 1.0
-    w_velocity_1h:  float = 0.9
-    w_velocity_24h: float = 0.3
-    w_delta_amount: float = 0.6
-    w_gap_short:    float = 0.8
-    w_remote:       float = 1.4
 
-    # -- Interaction terms ------------------------------------------------
-    
-    w_remote_x_foreign:    float = 0.8
-    w_remote_x_night:      float = 0.5
-    w_velocity_x_gap:      float = 0.4
-    w_newcountry_x_foreign: float = 0.6
+    # Transaction amounts (log-normal, personal offsets)
+    amount_mu_global:         float = 2.95
+    amount_sigma:             float = 1.2
+    amount_mu_personal_std:   float = 0.4
 
-    fraud_noise_std: float = 0.5
+    # Arrival times (von Mises peak)
+    time_peak_hour:           float = 13.0
+    time_kappa:               float = 1.5
+    time_personal_std_hr:     float = 3.0
 
-    period_duration_hours: float = 168.0
-    n_warmup_periods:      int   = 20
+    # Geography
+    countries:                List[str]   = field(default_factory=lambda: ["A", "B", "C"])
+    country_probs:            List[float] = field(default_factory=lambda: [0.85, 0.08, 0.07])
+    home_country_loyalty:     float = 0.88
+    new_country_window_h:     float = 336.0   # rolling window for foreign novelty (2 weeks)
 
-# =============================================================================
-# SECTION 1 - Customer history
-# =============================================================================
+    # Remote channel
+    remote_marginal_p:        float = 0.36
+    remote_fraud_lift:        float = 0.4
+
+    # Fraud model — intercept auto-calibrated at runtime for ~1% fraud rate
+    fraud_intercept:          float = -9.3272
+
+    w_amount:                 float = 1.75
+    w_night:                  float = 2.25
+    w_foreign:                float = 2.75
+    w_velocity_1h:            float = 1.75
+    w_velocity_24h:           float = 1.25
+    w_gap_short:              float = 1.50
+    w_remote:                 float = 2.50
+    w_remote_x_foreign:       float = 1.00
+    w_remote_x_night:         float = 1.00
+    w_velocity_x_gap:         float = 0.75
+
+    # Timing
+    period_duration_hours:    float = 168.0   # 1 week per period
+    n_warmup_periods:         int   = 20
+
+
+# ---------------------------------------------------------------------------
+# Customer history
+# ---------------------------------------------------------------------------
 
 class CustomerHistory:
 
@@ -60,801 +75,960 @@ class CustomerHistory:
         self.timestamps:  List[float] = []
         self.amounts:     List[float] = []
         self.countries:   List[str]   = []
+        self._ts_arr: Optional[np.ndarray] = None
+        self._dirty: bool = False
 
-    def features(self, ts: float, amount: float, country: str) -> dict:
-
+    def features(self, ts: float, amount: float, country: str,
+                 window_h: float = 336.0) -> dict:
         if not self.timestamps:
-            return dict(
-                velocity_1h=0.0, velocity_24h=0.0,
-                delta_amount=0.0, amount_zscore=0.0,
-                is_new_country=1, hours_since_last=48.0,
-            )
+            return dict(velocity_1h=0.0, velocity_24h=0.0,
+                        amount_zscore=0.0, is_foreign=int(country != self.home_country),
+                        hours_since_last=48.0)
 
+        if self._dirty or self._ts_arr is None:
+            self._ts_arr = np.asarray(self.timestamps)
+            self._dirty = False
+        arr  = self._ts_arr
         gap  = ts - self.timestamps[-1]
-        arr  = np.asarray(self.timestamps)
-        v1h  = len(arr) - int(arr.searchsorted(ts - 1.0,  side='left'))
-        v24h = len(arr) - int(arr.searchsorted(ts - 24.0, side='left'))
+        v1h  = len(arr) - int(arr.searchsorted(ts - 1.0,  side="left"))
+        v24h = len(arr) - int(arr.searchsorted(ts - 24.0, side="left"))
 
         log_amts = np.log(np.clip(self.amounts, 1e-6, None))
-        mu_log   = float(log_amts.mean())
-        std_log  = float(log_amts.std()) + 1e-6
-        z        = (float(np.log(max(amount, 1e-6))) - mu_log) / std_log
-
+        z        = (np.log(max(amount, 1e-6)) - log_amts.mean()) / max(log_amts.std(), 0.25)
         mean_amt = float(np.mean(self.amounts))
-        delta    = (amount - mean_amt) / (mean_amt + 1.0)
+
+        # is_foreign: rolling window novelty; treat a transaction as foreign if the country
+        # has not been seen recently.
+        recent = set(self.countries[int(arr.searchsorted(ts - window_h, side="left")):])
 
         return dict(
             velocity_1h      = float(v1h),
             velocity_24h     = float(v24h),
-            delta_amount     = round(delta, 4),
-            amount_zscore    = round(z, 4),
-            is_new_country   = int(country not in self.countries),
+            amount_zscore    = round(float(z), 4),
+            is_foreign       = int(country not in recent),
             hours_since_last = round(max(gap, 0.0), 3),
         )
 
     def record(self, ts: float, amount: float, country: str):
-        """Commit a completed transaction to history."""
         self.timestamps.append(ts)
         self.amounts.append(amount)
         self.countries.append(country)
+        self._dirty = True
 
-# =============================================================================
-# SECTION 2 - Fraud scoring
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Fraud scoring
+# ---------------------------------------------------------------------------
 
 def _sigmoid(x: float) -> float:
     return float(1.0 / (1.0 + np.exp(-np.clip(x, -15.0, 15.0))))
 
 
-def compute_fraud_score(
-    beh:        dict,
-    is_night:   int,
-    is_foreign: int,
-    is_remote:  int,
-    cfg:        GeneratorConfig,
-    noise_std:  float,
-    rng:        np.random.Generator,
-) -> float:
-    gap_signal = float(np.log1p(1.0 / max(beh["hours_since_last"], 0.01)))
+def calibrate_intercept(cfg: GeneratorConfig, target_rate: float = 0.01,
+                        seed: int = 42) -> GeneratorConfig:
+    """Binary search for fraud_intercept so mean P(fraud) ≈ target_rate."""
+    rng = np.random.default_rng(seed)
+    base_probe = replace(cfg, n_customers=2000)
+    profiles = _build_profiles(base_probe, rng)
+    hists = {p["customer_id"]: CustomerHistory(p["home_country"]) for p in profiles}
+    _run_warmup(profiles, hists, base_probe, rng)
 
-    # Main effects
+    logits_no_intercept = []
+    for prof in profiles:
+        hist = hists[prof["customer_id"]]
+        n = max(1, int(rng.poisson(base_probe.txns_per_customer_lambda)))
+        ts_arr = _sample_arrival_times(n, prof["time_peak_hr"], base_probe.time_kappa,
+                                       base_probe.period_duration_hours, 0.0, rng)
+        amounts = np.exp(rng.normal(prof["amount_mu"], base_probe.amount_sigma, n))
+        ctrs = _sample_countries(base_probe, prof["home_idx"], n, rng)
+        for i in range(n):
+            ts, amount, ctry = float(ts_arr[i]), float(amounts[i]), ctrs[i]
+            is_night = int(ts % 24.0 >= 22.0 or ts % 24.0 < 6.0)
+            txn_f = hist.features(ts, amount, ctry, base_probe.new_country_window_h)
+            is_foreign = txn_f["is_foreign"]
+            is_remote = int(rng.random() < base_probe.remote_marginal_p)
+            gap = float(np.log1p(1.0 / max(txn_f["hours_since_last"], 0.01)))
+            logit = (
+                cfg.w_amount           * txn_f["amount_zscore"]
+                + cfg.w_night          * is_night
+                + cfg.w_foreign        * is_foreign
+                + cfg.w_remote         * is_remote
+                + cfg.w_velocity_1h    * float(np.log1p(txn_f["velocity_1h"]))
+                + cfg.w_velocity_24h   * float(np.log1p(txn_f["velocity_24h"]))
+                + cfg.w_gap_short      * gap
+                + cfg.w_remote_x_foreign * (is_remote * is_foreign)
+                + cfg.w_remote_x_night   * (is_remote * is_night)
+                + cfg.w_velocity_x_gap   * (float(np.log1p(txn_f["velocity_1h"])) * gap)
+            )
+            logits_no_intercept.append(logit)
+            hist.record(ts, amount, ctry)
+
+    scores = np.array(logits_no_intercept)
+    lo, hi = -30.0, 5.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        rate = float(np.mean(1.0 / (1.0 + np.exp(-np.clip(scores + mid, -15.0, 15.0)))))
+        if abs(rate - target_rate) < 1e-6:
+            break
+        if rate > target_rate:
+            hi = mid
+        else:
+            lo = mid
+    intercept = float(0.5 * (lo + hi))
+    print(f"  Calibrated intercept: {intercept:.4f}  (target fraud rate: {target_rate*100:.1f}%)")
+    return replace(cfg, fraud_intercept=intercept)
+
+
+def compute_fraud_score(txn_features: dict, is_night: int, is_foreign: int,
+                        is_remote: int, cfg: GeneratorConfig) -> float:
+    """Returns P(fraud) via logistic regression on transaction features."""
+    gap = float(np.log1p(1.0 / max(txn_features["hours_since_last"], 0.01)))
     logit = (
         cfg.fraud_intercept
-        + cfg.w_amount       * beh["amount_zscore"]
-        + cfg.w_night        * is_night
-        + cfg.w_foreign      * is_foreign
-        + cfg.w_remote       * is_remote
-        + cfg.w_new_country  * beh["is_new_country"]
-        + cfg.w_velocity_1h  * float(np.log1p(beh["velocity_1h"]))
-        + cfg.w_velocity_24h * float(np.log1p(beh["velocity_24h"]))
-        + cfg.w_delta_amount * beh["delta_amount"]
-        + cfg.w_gap_short    * gap_signal
+        + cfg.w_amount             * txn_features["amount_zscore"]
+        + cfg.w_night              * is_night
+        + cfg.w_foreign            * is_foreign
+        + cfg.w_remote             * is_remote
+        + cfg.w_velocity_1h        * float(np.log1p(txn_features["velocity_1h"]))
+        + cfg.w_velocity_24h       * float(np.log1p(txn_features["velocity_24h"]))
+        + cfg.w_gap_short          * gap
+        + cfg.w_remote_x_foreign   * (is_remote * is_foreign)
+        + cfg.w_remote_x_night     * (is_remote * is_night)
+        + cfg.w_velocity_x_gap     * (float(np.log1p(txn_features["velocity_1h"])) * gap)
     )
-
-    # Interaction terms — joint effects stronger than main effects alone
-    # remote × foreign: CNP cross-border, dominant fraud channel (ECB, 2023)
-    logit += cfg.w_remote_x_foreign * (is_remote * is_foreign)
-    # remote × night: automated overnight CNP scripts (Whitrow et al., 2009)
-    logit += cfg.w_remote_x_night * (is_remote * is_night)
-    # velocity × gap: burst activity with rapid-fire timing = card-testing
-    logit += cfg.w_velocity_x_gap * (float(np.log1p(beh["velocity_1h"])) * gap_signal)
-    # new country × foreign: first-ever foreign country far more suspicious
-    logit += cfg.w_newcountry_x_foreign * (beh["is_new_country"] * is_foreign)
-
-    logit += float(rng.normal(0.0, noise_std))
     return _sigmoid(logit)
 
 
-# =============================================================================
-# SECTION 3 - Arrival process
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Arrival times
+# ---------------------------------------------------------------------------
 
-def _sample_arrival_times(
-    n_txn:        int,
-    peak_hour:    float,
-    kappa:        float,
-    duration_h:   float,
-    period_start: float,
-    rng:          np.random.Generator,
-) -> np.ndarray:
+def _sample_arrival_times(n_txn: int, peak_hour: float, kappa: float,
+                           duration_h: float, period_start: float,
+                           rng: np.random.Generator) -> np.ndarray:
+    loc_rad = (peak_hour / 24.0) * 2.0 * np.pi
 
-    peak_rad    = 2.0 * np.pi * (peak_hour / 24.0)
-    n_candidates = max(n_txn * 6, 50)
+    rad_samples = stats.vonmises.rvs(
+        kappa,
+        loc=loc_rad,
+        size=n_txn,
+        random_state=rng
+    )
 
-    accepted: List[float] = []
-    while len(accepted) < n_txn:
-        candidates = rng.uniform(
-            period_start, period_start + duration_h, size=n_candidates
-        )
-        hours_rad = 2.0 * np.pi * ((candidates % 24.0) / 24.0)
-        intensity = np.exp(kappa * np.cos(hours_rad - peak_rad))
-        intensity /= intensity.max()
-        u = rng.uniform(0.0, 1.0, size=n_candidates)
-        accepted.extend(candidates[u < intensity].tolist())
+    hour_samples = (rad_samples / (2.0 * np.pi)) * 24.0
+    hour_samples = hour_samples % 24.0
 
-    accepted = sorted(accepted)[:n_txn]
-    return np.array(accepted)
+    n_days = int(duration_h // 24)
+    day_offsets = rng.integers(0, n_days, size=n_txn) * 24.0
+
+    timestamps = period_start + day_offsets + hour_samples
+
+    return np.sort(timestamps)
 
 
-# =============================================================================
-# SECTION 4 - Main generator
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Profiles, countries, warmup
+# ---------------------------------------------------------------------------
 
-def _generate_one_period(
-    cfg:          GeneratorConfig,
-    histories:    Dict[int, CustomerHistory],
-    profiles:     list,
-    period_start: float,
-    txn_id_start: int,
-    period_idx:   int,
-    rng:          np.random.Generator,
-) -> pd.DataFrame:
+def _build_profiles(cfg: GeneratorConfig, rng: np.random.Generator) -> list:
+    p = np.asarray(cfg.country_probs, float); p /= p.sum()
+    return [{
+        "customer_id":  cid,
+        "home_country": (home := cfg.countries[rng.choice(len(cfg.countries), p=p)]),
+        "home_idx":     cfg.countries.index(home),
+        "amount_mu":    float(rng.normal(cfg.amount_mu_global, cfg.amount_mu_personal_std)),
+        "time_peak_hr": float(np.clip(rng.normal(cfg.time_peak_hour, cfg.time_personal_std_hr), 0, 23.99)),
+    } for cid in range(cfg.n_customers)]
 
-    rows: List[dict] = []
+
+def _sample_countries(cfg: GeneratorConfig, home_idx: int, n: int,
+                      rng: np.random.Generator) -> List[str]:
+    p = np.full(len(cfg.countries), (1 - cfg.home_country_loyalty) / (len(cfg.countries) - 1))
+    p[home_idx] = cfg.home_country_loyalty
+    idxs = rng.choice(len(cfg.countries), size=n, p=p)
+    return [cfg.countries[i] for i in idxs]
+
+
+def _run_warmup(profiles: list, histories: Dict[int, CustomerHistory],
+                cfg: GeneratorConfig, rng: np.random.Generator):
+    for w in range(cfg.n_warmup_periods):
+        start = -(cfg.n_warmup_periods - w) * cfg.period_duration_hours
+        for prof in profiles:
+            n    = max(1, int(rng.poisson(cfg.txns_per_customer_lambda)))
+            ts   = _sample_arrival_times(n, prof["time_peak_hr"], cfg.time_kappa,
+                                         cfg.period_duration_hours, start, rng)
+            amts = rng.lognormal(prof["amount_mu"], cfg.amount_sigma, size=n)
+            ctrs = _sample_countries(cfg, prof["home_idx"], n, rng)
+            h    = histories[prof["customer_id"]]
+            for i in range(n):
+                h.record(float(ts[i]), float(amts[i]), ctrs[i])
+
+
+# ---------------------------------------------------------------------------
+# Period generator
+# ---------------------------------------------------------------------------
+
+def _generate_one_period(cfg: GeneratorConfig, histories: Dict[int, CustomerHistory],
+                         profiles: list, period_start: float,
+                         txn_id_start: int, period_idx: int,
+                         rng: np.random.Generator) -> pd.DataFrame:
+    rows:  List[dict] = []
     txn_id = txn_id_start
 
     for prof in profiles:
-        cid      = prof["customer_id"]
-        history  = histories[cid]
-        home     = prof["home_country"]
-        home_idx = cfg.countries.index(home)
+        cid, home = prof["customer_id"], prof["home_country"]
+        hist      = histories[cid]
+        n         = max(1, int(rng.poisson(cfg.txns_per_customer_lambda)))
+        ts_arr    = _sample_arrival_times(n, prof["time_peak_hr"], cfg.time_kappa,
+                                          cfg.period_duration_hours, period_start, rng)
+        amounts   = rng.lognormal(prof["amount_mu"], cfg.amount_sigma, size=n)
+        ctrs      = _sample_countries(cfg, prof["home_idx"], n, rng)
 
-        n_txn = max(1, int(rng.poisson(cfg.txns_per_customer_lambda)))
-
-        # Arrival times: personal time preference encoded in arrival process
-        timestamps = _sample_arrival_times(
-            n_txn        = n_txn,
-            peak_hour    = prof["time_peak_hr"],
-            kappa        = cfg.time_kappa,
-            duration_h   = cfg.period_duration_hours,
-            period_start = period_start,
-            rng          = rng,
-        )
-
-        # Amounts: personal log-normal
-        amounts = rng.lognormal(prof["amount_mu"], cfg.amount_sigma, size=n_txn)
-
-        # Countries: biased toward home country
-        home_p = np.full(
-            len(cfg.countries),
-            (1.0 - cfg.home_country_loyalty) / (len(cfg.countries) - 1)
-        )
-        home_p[home_idx] = cfg.home_country_loyalty
-        countries = [
-            cfg.countries[rng.choice(len(cfg.countries), p=home_p)]
-            for _ in range(n_txn)
-        ]
-
-        noise_std = cfg.fraud_noise_std + prof["risk_score"] * 0.5
-
-        for i in range(n_txn):
-            ts        = float(timestamps[i])
-            amount    = float(amounts[i])
-            country   = countries[i]
-
-            # time_hour derived directly from timestamp (not drawn independently)
+        for i in range(n):
+            ts, amount, ctry = float(ts_arr[i]), float(amounts[i]), ctrs[i]
             time_hour  = ts % 24.0
             is_night   = int(time_hour >= 22.0 or time_hour < 6.0)
-            is_foreign = int(country != home)
-
-            beh = history.features(ts, amount, country)
-
-            # Remote flag: drawn conditionally on fraud propensity.
-            # Compute partial logit (excluding remote term) centred at the
-            # intercept so that sigmoid(0) = 0.5 for a typical transaction.
-            gap_signal = float(np.log1p(1.0 / max(beh["hours_since_last"], 0.01)))
-            partial_logit = (
-                cfg.fraud_intercept
-                + cfg.w_amount       * beh["amount_zscore"]
-                + cfg.w_night        * is_night
-                + cfg.w_foreign      * is_foreign
-                + cfg.w_new_country  * beh["is_new_country"]
-                + cfg.w_velocity_1h  * float(np.log1p(beh["velocity_1h"]))
-                + cfg.w_velocity_24h * float(np.log1p(beh["velocity_24h"]))
-                + cfg.w_delta_amount * beh["delta_amount"]
-                + cfg.w_gap_short    * gap_signal
-            )
-            # fraud_propensity in (0,1); centred so 0.5 = typical transaction.
-            # p_remote rises above remote_marginal_p for high-propensity txns
-            # and falls below it for low-propensity txns.
-            fraud_propensity = _sigmoid(partial_logit - cfg.fraud_intercept)
-            p_remote = float(np.clip(
-                cfg.remote_marginal_p + cfg.remote_fraud_lift * (fraud_propensity - 0.5),
-                0.01, 0.99,
-            ))
-            is_remote = int(rng.random() < p_remote)
-            score = compute_fraud_score(
-                beh, is_night, is_foreign, is_remote, cfg, noise_std, rng
-            )
-            is_fraud = int(rng.random() < score)
+            txn_features = hist.features(ts, amount, ctry, cfg.new_country_window_h)
+            is_foreign = txn_features["is_foreign"]
+            is_remote  = int(rng.random() < cfg.remote_marginal_p)
+            score = compute_fraud_score(txn_features, is_night, is_foreign, is_remote, cfg)
 
             rows.append({
-                "period"          : period_idx,
-                "customer_id"     : cid,
-                "home_country"    : home,
-                "txn_id"          : txn_id,
-                "timestamp_h"     : round(ts, 4),
-                "time_hour"       : round(time_hour, 3),
-                "amount"          : round(amount, 2),
-                "country"         : country,
-                "is_remote"       : is_remote,
-                "velocity_1h"     : round(beh["velocity_1h"], 1),
-                "velocity_24h"    : round(beh["velocity_24h"], 1),
-                "delta_amount"    : beh["delta_amount"],
-                "amount_zscore"   : beh["amount_zscore"],
-                "is_new_country"  : beh["is_new_country"],
-                "hours_since_last": beh["hours_since_last"],
-                "fraud_score"     : round(score, 6),
-                "is_fraud"        : is_fraud,
+                "period": period_idx, "customer_id": cid, "home_country": home,
+                "txn_id": txn_id, "timestamp_h": round(ts, 4), "time_hour": round(time_hour, 3),
+                "amount": round(amount, 2), "country": ctry, "is_remote": is_remote,
+                "velocity_1h": round(txn_features["velocity_1h"], 1),
+                "velocity_24h": round(txn_features["velocity_24h"], 1),
+                "amount_zscore": txn_features["amount_zscore"],
+                "is_foreign": txn_features["is_foreign"],
+                "hours_since_last": txn_features["hours_since_last"],
+                "fraud_score": float(score),
             })
             txn_id += 1
-            history.record(ts, amount, country)
+            hist.record(ts, amount, ctry)
 
-    df = pd.DataFrame(rows).sort_values(
-        ["customer_id", "timestamp_h"]
-    ).reset_index(drop=True)
-    return df
+    df = pd.DataFrame(rows)
 
+    df["is_fraud"] = rng.random(len(df)) < df["fraud_score"].to_numpy()
+    df["is_fraud"] = df["is_fraud"].astype(int)
 
-def _build_profiles(cfg: GeneratorConfig, rng: np.random.Generator) -> list:
-    """Sample customer profiles from population priors."""
-    country_p = np.array(cfg.country_probs, dtype=float)
-    country_p /= country_p.sum()
-    profiles = []
-    for cid in range(cfg.n_customers):
-        home = cfg.countries[rng.choice(len(cfg.countries), p=country_p)]
-        profiles.append({
-            "customer_id" : cid,
-            "home_country": home,
-            "amount_mu"   : float(rng.normal(
-                cfg.amount_mu_global, cfg.amount_mu_personal_std
-            )),
-            "time_peak_hr": float(np.clip(
-                rng.normal(cfg.time_peak_hour, cfg.time_personal_std_hr),
-                0.0, 23.99
-            )),
-
-            "risk_score"  : float(rng.beta(1, 20)),
-        })
-    return profiles
-
-
-def _run_warmup(
-    profiles:  list,
-    histories: Dict[int, CustomerHistory],
-    cfg:       GeneratorConfig,
-    rng:       np.random.Generator,
-):
-
-    for w in range(cfg.n_warmup_periods):
-        warmup_start = -(cfg.n_warmup_periods - w) * cfg.period_duration_hours
-        for prof in profiles:
-            home     = prof["home_country"]
-            home_idx = cfg.countries.index(home)
-            n_txn    = max(1, int(rng.poisson(cfg.txns_per_customer_lambda)))
-
-            timestamps = _sample_arrival_times(
-                n_txn=n_txn, peak_hour=prof["time_peak_hr"],
-                kappa=cfg.time_kappa, duration_h=cfg.period_duration_hours,
-                period_start=warmup_start, rng=rng,
-            )
-            amounts = rng.lognormal(prof["amount_mu"], cfg.amount_sigma, size=n_txn)
-            home_p  = np.full(
-                len(cfg.countries),
-                (1.0 - cfg.home_country_loyalty) / (len(cfg.countries) - 1)
-            )
-            home_p[home_idx] = cfg.home_country_loyalty
-            countries = [
-                cfg.countries[rng.choice(len(cfg.countries), p=home_p)]
-                for _ in range(n_txn)
-            ]
-            hist = histories[prof["customer_id"]]
-            for i in range(n_txn):
-                hist.record(float(timestamps[i]), float(amounts[i]), countries[i])
-
-
-# =============================================================================
-# SECTION 5 - Public API
-# =============================================================================
-
-def generate(
-    cfg:     Optional[GeneratorConfig] = None,
-    seed:    int = 42,
-    verbose: bool = True,
-) -> pd.DataFrame:
-
-    if cfg is None:
-        cfg = GeneratorConfig()
-
-    rng = np.random.default_rng(seed)
-
-    profiles  = _build_profiles(cfg, rng)
-    histories = {p["customer_id"]: CustomerHistory(p["home_country"])
-                 for p in profiles}
-
-    _run_warmup(profiles, histories, cfg, rng)
-
-    df = _generate_one_period(
-        cfg          = cfg,
-        histories    = histories,
-        profiles     = profiles,
-        period_start = 0.0,
-        txn_id_start = 0,
-        period_idx   = 1,
-        rng          = rng,
+    return (
+        df.sort_values(["customer_id", "timestamp_h"])
+          .reset_index(drop=True)
     )
-    df = df.drop(columns=["period"])
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def generate(cfg: Optional[GeneratorConfig] = None, seed: int = 42,
+             verbose: bool = True) -> pd.DataFrame:
+    """Generate a single stationary period with warmup."""
+    cfg = cfg or GeneratorConfig()
+    rng = np.random.default_rng(seed)
+    profiles  = _build_profiles(cfg, rng)
+    histories = {p["customer_id"]: CustomerHistory(p["home_country"]) for p in profiles}
+    _run_warmup(profiles, histories, cfg, rng)
+    df = _generate_one_period(cfg, histories, profiles, 0.0, 0, 1, rng).drop(columns=["period"])
     if verbose:
         _print_summary(df, cfg)
-
     return df
 
 
-def generate_multiperiod(
-    n_periods: int = 10,
-    cfg:       Optional[GeneratorConfig] = None,
-    cfg_list:  Optional[List[GeneratorConfig]] = None,
-    seed:      int = 42,
-    verbose:   bool = True,
-    label:     str = "",
-) -> pd.DataFrame:
-    """Generate multiple periods.
-    Pass cfg_list (one config per period) for drift experiments.
-    If omitted, cfg is used for every period (stationary baseline).
-    """
-    base_cfg = cfg if cfg is not None else GeneratorConfig()
-    if cfg_list is None:
-        cfg_list = [base_cfg] * n_periods
-    else:
-        n_periods = len(cfg_list)
+def generate_multiperiod(n_periods: int = 10,
+                         cfg: Optional[GeneratorConfig] = None,
+                         cfg_list: Optional[List[GeneratorConfig]] = None,
+                         seed: int = 42, verbose: bool = True,
+                         label: str = "") -> pd.DataFrame:
+    """Generate multiple periods. Pass cfg_list for drift experiments."""
+    base     = cfg or GeneratorConfig()
+    cfg_list = cfg_list or [base] * n_periods
+    rng      = np.random.default_rng(seed)
+    profiles  = _build_profiles(base, rng)
+    histories = {p["customer_id"]: CustomerHistory(p["home_country"]) for p in profiles}
+    _run_warmup(profiles, histories, base, rng)
 
-    rng = np.random.default_rng(seed)
-    profiles  = _build_profiles(base_cfg, rng)
-    histories = {p["customer_id"]: CustomerHistory(p["home_country"])
-                 for p in profiles}
-    _run_warmup(profiles, histories, base_cfg, rng)
+    frames, txn_id = [], 0
+    _W = ["w_amt","w_nt","w_fgn","w_v1h","w_v24h","w_gap","w_rmt","w_r_fg","w_r_nt","w_v_gp"]
+    _W_ATTRS = ["w_amount","w_night","w_foreign","w_velocity_1h","w_velocity_24h",
+                "w_gap_short","w_remote","w_remote_x_foreign","w_remote_x_night","w_velocity_x_gap"]
 
-    all_frames = []
-    txn_id = 0
-
-    hdr = f"  {label}  ({n_periods} periods)" if label else f"  Multi-period  ({n_periods} periods)"
     if verbose:
-        print(f"\n{'═'*72}")
-        print(hdr)
-        print(f"{'═'*72}")
-        print(f"  {'Per':>3}  {'Txns':>6}  {'Fraud%':>7}  {'AvgAmt':>8}  "
-              f"{'NightFr%':>9}  {'ForeignFr%':>11}  {'RemoteFr%':>10}")
-        print("  " + "-" * 62)
+        hdr = f"  {label}  ({len(cfg_list)} periods)" if label else f"  ({len(cfg_list)} periods)"
+        print(f"\n{'='*100}\n{hdr}\n{'='*100}")
+        header = f"  {'Per':>3}  {'Txns':>6}  {'Fraud%':>7}"
+        for name in _W:
+            header += f"  {name:>7}"
+        print(header)
+        print("  " + "-"*80)
 
-    for p in range(1, n_periods + 1):
-        period_cfg   = cfg_list[p - 1]
-        period_start = (p - 1) * base_cfg.period_duration_hours
-        period_rng   = np.random.default_rng(rng.integers(0, 2**31))
-
-        df_p = _generate_one_period(
-            cfg          = period_cfg,
-            histories    = histories,
-            profiles     = profiles,
-            period_start = period_start,
-            txn_id_start = txn_id,
-            period_idx   = p,
-            rng          = period_rng,
-        )
+    for p, pcfg in enumerate(cfg_list, start=1):
+        period_start = (p - 1) * base.period_duration_hours
+        df_p = _generate_one_period(pcfg, histories, profiles,
+                                    period_start, txn_id, p,
+                                    np.random.default_rng(rng.integers(0, 2**31)))
         txn_id += len(df_p)
-        all_frames.append(df_p)
+        frames.append(df_p)
 
         if verbose:
-            fraud_pct  = df_p["is_fraud"].mean() * 100
-            avg_amt    = df_p["amount"].mean()
-            night_mask = (df_p["time_hour"] >= 22) | (df_p["time_hour"] < 6)
-            fgn_mask   = df_p["country"] != df_p["home_country"]
-            rem_mask   = df_p["is_remote"] == 1
-            night_fr   = df_p.loc[night_mask, "is_fraud"].mean() * 100 if night_mask.any() else 0.0
-            fgn_fr     = df_p.loc[fgn_mask,  "is_fraud"].mean() * 100 if fgn_mask.any() else 0.0
-            rem_fr     = df_p.loc[rem_mask,   "is_fraud"].mean() * 100 if rem_mask.any() else 0.0
-            print(f"  {p:>3}  {len(df_p):>6,}  {fraud_pct:>6.2f}%  "
-                  f"EUR{avg_amt:>6.1f}  {night_fr:>8.1f}%  {fgn_fr:>10.1f}%  {rem_fr:>9.1f}%")
+            row = f"  {p:>3}  {len(df_p):>6,}  {df_p['is_fraud'].mean()*100:>6.2f}%"
+            for attr in _W_ATTRS:
+                row += f"  {getattr(pcfg, attr):>7.3f}"
+            print(row)
 
-    df = pd.concat(all_frames, ignore_index=True)
+    df = pd.concat(frames, ignore_index=True)
     if verbose:
-        overall = df["is_fraud"].mean() * 100
-        print("  " + "-" * 62)
-        print(f"  Overall fraud rate: {overall:.2f}%  |  Total rows: {len(df):,}\n")
+        print("  " + "-"*80)
+        print(f"  Overall fraud rate: {df['is_fraud'].mean()*100:.2f}%  |  Total rows: {len(df):,}\n")
     return df
 
-# =============================================================================
-# SECTION 6 - Calibration diagnostics
-# =============================================================================
 
-def check_calibration(
-    cfg:     Optional[GeneratorConfig] = None,
-    seeds:   List[int] = None,
-    verbose: bool = True,
-) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Diagnostics
 
-    if cfg   is None: cfg   = GeneratorConfig()
-    if seeds is None: seeds = [0, 1, 2, 3, 4]
-
-    records = []
+def check_calibration(cfg: Optional[GeneratorConfig] = None,
+                      seeds: Optional[List[int]] = None,
+                      verbose: bool = True) -> pd.DataFrame:
+    """Fraud rate and segment breakdown across seeds."""
+    cfg, seeds = cfg or GeneratorConfig(), seeds or [0, 1, 2, 3, 4]
+    rows = []
     for s in seeds:
-        df = generate(cfg, seed=s, verbose=False)
-
-        night   = (df["time_hour"] >= 22) | (df["time_hour"] < 6)
-        foreign = df["country"] != df["home_country"]
-        remote  = df["is_remote"] == 1
-        top_amt = df["amount"] >= df["amount"].quantile(0.90)
-        bot_amt = df["amount"] <= df["amount"].quantile(0.10)
-
-        records.append({
-            "seed"              : s,
-            "n_txn"             : len(df),
-            "fraud_rate"        : round(df["is_fraud"].mean(), 4),
-            "fraud_night"       : round(df.loc[night,    "is_fraud"].mean(), 4),
-            "fraud_day"         : round(df.loc[~night,   "is_fraud"].mean(), 4),
-            "fraud_foreign"     : round(df.loc[foreign,  "is_fraud"].mean(), 4) if foreign.any() else None,
-            "fraud_domestic"    : round(df.loc[~foreign, "is_fraud"].mean(), 4),
-            "fraud_remote"      : round(df.loc[remote,   "is_fraud"].mean(), 4) if remote.any() else None,
-            "fraud_inperson"    : round(df.loc[~remote,  "is_fraud"].mean(), 4),
-            "fraud_top_amt"     : round(df.loc[top_amt,  "is_fraud"].mean(), 4),
-            "fraud_bot_amt"     : round(df.loc[bot_amt,  "is_fraud"].mean(), 4),
-            "fraud_new_country" : round(df.loc[df["is_new_country"]==1, "is_fraud"].mean(), 4)
-                                  if (df["is_new_country"]==1).any() else None,
+        df  = generate(cfg, seed=s, verbose=False)
+        nm  = (df["time_hour"] >= 22) | (df["time_hour"] < 6)
+        fg  = df["is_foreign"] == 1
+        rm  = df["is_remote"] == 1
+        rows.append({
+            "seed":             s,
+            "n_txn":            len(df),
+            "fraud_rate":       round(df["is_fraud"].mean(), 4),
+            "fraud_night":      round(df.loc[nm,  "is_fraud"].mean(), 4),
+            "fraud_day":        round(df.loc[~nm, "is_fraud"].mean(), 4),
+            "fraud_foreign":    round(df.loc[fg,  "is_fraud"].mean(), 4) if fg.any()  else None,
+            "fraud_domestic":   round(df.loc[~fg, "is_fraud"].mean(), 4),
+            "fraud_remote":     round(df.loc[rm,  "is_fraud"].mean(), 4) if rm.any()  else None,
+            "fraud_inperson":   round(df.loc[~rm, "is_fraud"].mean(), 4),
+            "fraud_top_amt":    round(df.loc[df["amount"] >= df["amount"].quantile(.9), "is_fraud"].mean(), 4),
         })
-
-    results = pd.DataFrame(records)
-
+    result = pd.DataFrame(rows)
     if verbose:
-        print(f"\n{'═'*72}")
-        print(f"  Calibration check across {len(seeds)} seeds")
-        print(f"{'═'*72}")
-        print(results.to_string(index=False))
-        print(f"\n  fraud_rate  mean={results['fraud_rate'].mean():.4f}  "
-              f"std={results['fraud_rate'].std():.4f}\n")
+        print(f"\n{'='*72}\n  Calibration check — {len(seeds)} seeds\n{'='*72}")
+        print(result.to_string(index=False))
+        print(f"\n  fraud_rate  mean={result['fraud_rate'].mean():.4f}  "
+              f"std={result['fraud_rate'].std():.4f}\n")
+    return result
 
-    return results
-
-
-# =============================================================================
-# SECTION 7 - Summary printer
-# =============================================================================
 
 def _print_summary(df: pd.DataFrame, cfg: GeneratorConfig):
-    n         = len(df)
-    n_fraud   = int(df["is_fraud"].sum())
-    fraud_pct = n_fraud / n * 100
-    avg_amt   = df["amount"].mean()
-    pct_a     = (df["country"] == "A").mean() * 100
-    pct_rem   = df["is_remote"].mean() * 100
-    avg_score = df["fraud_score"].mean()
-
-    # Timestamp consistency check
-    if "timestamp_h" in df.columns:
-        derived  = (df["timestamp_h"] % 24).round(3)
-        mismatch = (derived - df["time_hour"]).abs().max()
-        ts_check = (f"consistent (max diff={mismatch:.6f}h)"
-                    if mismatch < 0.01 else f"MISMATCH max={mismatch:.4f}h")
-    else:
-        ts_check = "n/a"
-
-    print(f"\n{'═'*60}")
-    print(f"  Fraud Generator v3")
-    print(f"{'═'*60}")
-    print(f"  Customers    : {cfg.n_customers}")
-    print(f"  Transactions : {n:,}")
-    print(f"  Fraud rate   : {fraud_pct:.2f}%  ({n_fraud} fraudulent)")
-    print(f"  Avg amount   : EUR{avg_amt:.2f}")
-    print(f"  Remote txns  : {pct_rem:.1f}%")
-    print(f"  Country A%   : {pct_a:.1f}%")
-    print(f"  Avg P(fraud) : {avg_score:.4f}")
-    print(f"  ts/hour check: {ts_check}")
-    print(f"{'═'*60}\n")
+    n, nf = len(df), int(df["is_fraud"].sum())
+    print(f"\n{'='*55}")
+    print(f"  n={n:,}  fraud={nf/n*100:.2f}%  amt=EUR{df['amount'].mean():.2f}"
+          f"  remote={df['is_remote'].mean()*100:.1f}%  avg_P={df['fraud_score'].mean():.4f}")
+    print(f"{'='*55}\n")
 
 
-# =============================================================================
-# SECTION 8 - Entry point
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Drift experiment helpers
+# ---------------------------------------------------------------------------
+
+def _build_probe_matrix(cfg: GeneratorConfig, seed: int, n_probe_customers: int = 2000) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    probe_cfg = replace(cfg, n_customers=n_probe_customers)
+
+    profiles = _build_profiles(probe_cfg, rng)
+    hists = {p["customer_id"]: CustomerHistory(p["home_country"]) for p in profiles}
+    _run_warmup(profiles, hists, probe_cfg, rng)
+
+    rows = []
+
+    for prof in profiles:
+        hist = hists[prof["customer_id"]]
+        n = max(1, int(rng.poisson(probe_cfg.txns_per_customer_lambda)))
+
+        ts_arr = _sample_arrival_times(
+            n, prof["time_peak_hr"], probe_cfg.time_kappa,
+            probe_cfg.period_duration_hours, 0.0, rng
+        )
+        amounts = np.exp(rng.normal(prof["amount_mu"], probe_cfg.amount_sigma, n))
+        ctrs = _sample_countries(probe_cfg, prof["home_idx"], n, rng)
+
+        for i in range(n):
+            ts = float(ts_arr[i])
+            amount = float(amounts[i])
+            ctry = ctrs[i]
+
+            is_night = int(ts % 24.0 >= 22.0 or ts % 24.0 < 6.0)
+            txn_f = hist.features(ts, amount, ctry, probe_cfg.new_country_window_h)
+            is_remote = int(rng.random() < probe_cfg.remote_marginal_p)
+
+            gap = float(np.log1p(1.0 / max(txn_f["hours_since_last"], 0.01)))
+            v1 = float(np.log1p(txn_f["velocity_1h"]))
+            v24 = float(np.log1p(txn_f["velocity_24h"]))
+            is_foreign = txn_f["is_foreign"]
+
+            rows.append({
+                "amount_zscore": txn_f["amount_zscore"],
+                "is_night": is_night,
+                "is_foreign": is_foreign,
+                "is_remote": is_remote,
+                "v1": v1,
+                "v24": v24,
+                "gap": gap,
+                "remote_x_foreign": is_remote * is_foreign,
+                "remote_x_night": is_remote * is_night,
+                "velocity_x_gap": v1 * gap,
+            })
+
+            hist.record(ts, amount, ctry)
+
+    return pd.DataFrame(rows)
+
+
+def _estimate_fraud_rate_from_probe(cfg: GeneratorConfig, probe: pd.DataFrame) -> float:
+    logit = (
+        cfg.fraud_intercept
+        + cfg.w_amount * probe["amount_zscore"].to_numpy()
+        + cfg.w_night * probe["is_night"].to_numpy()
+        + cfg.w_foreign * probe["is_foreign"].to_numpy()
+        + cfg.w_remote * probe["is_remote"].to_numpy()
+        + cfg.w_velocity_1h * probe["v1"].to_numpy()
+        + cfg.w_velocity_24h * probe["v24"].to_numpy()
+        + cfg.w_gap_short * probe["gap"].to_numpy()
+        + cfg.w_remote_x_foreign * probe["remote_x_foreign"].to_numpy()
+        + cfg.w_remote_x_night * probe["remote_x_night"].to_numpy()
+        + cfg.w_velocity_x_gap * probe["velocity_x_gap"].to_numpy()
+    )
+
+    return float(np.mean(1.0 / (1.0 + np.exp(-np.clip(logit, -15.0, 15.0)))))
+
+
+def _calibrate_B_weights(pattern_A: GeneratorConfig, seed: int,
+                          target_rate: float = 0.01) -> GeneratorConfig:
+    """Scale pattern B's active weights until mean P(fraud) ≈ target_rate.
+
+    Intercept is fixed at pattern_A.fraud_intercept. Only the B-side feature
+    weights (foreign, velocity, gap) are scaled by a multiplier m found via
+    binary search. Structural zeros (night, remote, interactions) are enforced.
+    """
+    probe = _build_probe_matrix(pattern_A, seed)
+
+    raw = dict(w_foreign=3.0, w_velocity_1h=3.0, w_velocity_24h=2.0,
+               w_gap_short=1.5, w_velocity_x_gap=1.5)
+
+    lo, hi = 0.01, 5.0
+    best_cfg, best_err = None, float("inf")
+
+    for _ in range(40):
+        m = 0.5 * (lo + hi)
+        candidate = replace(pattern_A,
+            w_night=0.0, w_remote=0.0,
+            w_remote_x_foreign=0.0, w_remote_x_night=0.0,
+            w_foreign        = round(raw["w_foreign"]        * m, 4),
+            w_velocity_1h    = round(raw["w_velocity_1h"]    * m, 4),
+            w_velocity_24h   = round(raw["w_velocity_24h"]   * m, 4),
+            w_gap_short      = round(raw["w_gap_short"]      * m, 4),
+            w_velocity_x_gap = round(raw["w_velocity_x_gap"] * m, 4),
+        )
+        rate = _estimate_fraud_rate_from_probe(candidate, probe)
+        err  = abs(rate - target_rate)
+        if err < best_err:
+            best_cfg, best_err = candidate, err
+        if err < 1e-5:
+            break
+        if rate > target_rate:
+            hi = m
+        else:
+            lo = m
+
+    m_final = 0.5 * (lo + hi)
+    print(f"  Pattern B weight multiplier: {m_final:.4f}  (estimated rate: {rate:.4f})")
+    return best_cfg
+
+def _calibrate_intermediate_weights(
+    cfg_candidate: GeneratorConfig,
+    seed: int,
+    target_rate: float = 0.01,
+) -> GeneratorConfig:
+
+    probe = _build_probe_matrix(cfg_candidate, seed)
+
+    fields = [
+        "w_amount",
+        "w_night",
+        "w_foreign",
+        "w_velocity_1h",
+        "w_velocity_24h",
+        "w_gap_short",
+        "w_remote",
+        "w_remote_x_foreign",
+        "w_remote_x_night",
+        "w_velocity_x_gap",
+    ]
+
+    original = {f: getattr(cfg_candidate, f) for f in fields}
+
+    lo, hi = 0.05, 10.0
+    best_cfg = cfg_candidate
+    best_err = float("inf")
+    best_rate = None
+    best_m = None
+
+    for _ in range(50):
+        m = 0.5 * (lo + hi)
+
+        scaled_cfg = replace(
+            cfg_candidate,
+            **{f: round(original[f] * m, 4) for f in fields}
+        )
+
+        rate = _estimate_fraud_rate_from_probe(scaled_cfg, probe)
+        err = abs(rate - target_rate)
+
+        if err < best_err:
+            best_cfg = scaled_cfg
+            best_err = err
+            best_rate = rate
+            best_m = m
+
+        if rate > target_rate:
+            hi = m
+        else:
+            lo = m
+
+    print(
+        f"  Intermediate config calibrated: "
+        f"m={best_m:.4f}, estimated rate={best_rate:.4f}"
+    )
+
+    return best_cfg
+
+def _build_axis12_endpoints(seed: int) -> tuple[GeneratorConfig, GeneratorConfig]:
+    pattern_A = calibrate_intercept(replace(GeneratorConfig(),
+        w_amount=1.50,
+        w_night=3.00,
+        w_foreign=0.00,
+        w_velocity_1h=0.00,
+        w_velocity_24h=0.00,
+        w_gap_short=0.50,
+        w_remote=3.00,
+        w_remote_x_foreign=0.00,
+        w_remote_x_night=1.00,
+        w_velocity_x_gap=0.00,
+    ), target_rate=0.01, seed=seed)
+
+    pattern_B = _calibrate_B_weights(
+        pattern_A=pattern_A,
+        seed=seed,
+        target_rate=0.01,
+    )
+
+    return pattern_A, pattern_B
+
+def _build_cfg_list_axis12(
+    pattern_A: GeneratorConfig,
+    pattern_B: GeneratorConfig,
+    d: float,
+    speed: str,
+    seed: int,
+    max_d: float = 1.50,
+) -> List[GeneratorConfig]:
+    """
+    Interpolate from Pattern A toward Pattern B for Axis 1 and Axis 2.
+
+    Pattern A and Pattern B are both around 1% fraud.
+    Intermediate configs are also locally calibrated to stay around 1% fraud.
+
+    Important:
+    - The intercept is never changed.
+    - The interpolation fraction still controls how far we move from A to B.
+    - Local calibration only rescales overall weight strength.
+    """
+
+    t = d / max_d
+    n = 10
+
+    def _interp(a: float, b: float, frac: float) -> float:
+        return round(a + frac * (b - a), 4)
+
+    def _cfg(frac: float) -> GeneratorConfig:
+        if frac <= 0.0:
+            return pattern_A
+
+        if frac >= 1.0:
+            return pattern_B
+
+        candidate = replace(
+            pattern_A,
+
+            # Keep intercept fixed
+            fraud_intercept=pattern_A.fraud_intercept,
+
+            # Interpolate only weights
+            w_night=_interp(pattern_A.w_night, pattern_B.w_night, frac),
+            w_foreign=_interp(pattern_A.w_foreign, pattern_B.w_foreign, frac),
+            w_velocity_1h=_interp(pattern_A.w_velocity_1h, pattern_B.w_velocity_1h, frac),
+            w_velocity_24h=_interp(pattern_A.w_velocity_24h, pattern_B.w_velocity_24h, frac),
+            w_gap_short=_interp(pattern_A.w_gap_short, pattern_B.w_gap_short, frac),
+            w_remote=_interp(pattern_A.w_remote, pattern_B.w_remote, frac),
+            w_remote_x_foreign=_interp(
+                pattern_A.w_remote_x_foreign,
+                pattern_B.w_remote_x_foreign,
+                frac,
+            ),
+            w_remote_x_night=_interp(
+                pattern_A.w_remote_x_night,
+                pattern_B.w_remote_x_night,
+                frac,
+            ),
+            w_velocity_x_gap=_interp(
+                pattern_A.w_velocity_x_gap,
+                pattern_B.w_velocity_x_gap,
+                frac,
+            ),
+        )
+
+        return _calibrate_intermediate_weights(
+            cfg_candidate=candidate,
+            seed=seed,
+            target_rate=0.01,
+        )
+
+    if speed == "sudden":
+        return [pattern_A if i < 5 else _cfg(t) for i in range(n)]
+
+    if speed == "gradual":
+        return [_cfg(t * i / (n - 1)) for i in range(n)]
+
+    raise ValueError(f"speed must be 'sudden' or 'gradual', got {speed!r}")
+
+
+# ---------------------------------------------------------------------------
+# Dataset saving
+# ---------------------------------------------------------------------------
+
+def _finish_dataset(label: str, df: pd.DataFrame, meta: dict) -> None:
+    """Save CSV + metadata JSON."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    csv_path = os.path.join(OUT_DIR, f"{label}.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"  Saved: {csv_path}")
+
+    json_path = os.path.join(OUT_DIR, f"{label}_metadata.json")
+    with open(json_path, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"  Metadata: {json_path}")
+
+# ---------------------------------------------------------------------------
+# Baseline: Stationary Pattern A
 #
-# SENSITIVITY ANALYSIS — "When does the model break?"
-# ====================================================
+
+def run_baseline(seed: int = SEED) -> None:
+    """Baseline — stationary Pattern A across all 10 periods.
+
+    No drift is introduced. This gives the no-drift reference condition.
+    """
+    pattern_A, _ = _build_axis12_endpoints(seed)
+
+    cfg_list = [pattern_A for _ in range(10)]
+    label = "baseline_pattern_A_stationary"
+
+    print(f"\n{'='*60}\nBaseline — stationary Pattern A\n{'='*60}")
+
+    df = generate_multiperiod(
+        cfg_list=cfg_list,
+        cfg=pattern_A,
+        seed=seed,
+        verbose=True,
+        label=label,
+    )
+
+    _finish_dataset(label, df, {
+        "axis": "baseline",
+        "label": label,
+        "seed": seed,
+        "n_periods": len(cfg_list),
+        "period_config": {
+            str(p): "A"
+            for p in range(1, len(cfg_list) + 1)
+        },
+    })
+# ---------------------------------------------------------------------------
+# Axis 1 — Drift Magnitude
+# ---------------------------------------------------------------------------
+
+def run_axis1(deltas: List[float] = DELTAS_AXIS1, seed: int = SEED) -> None:
+    """Axis 1 — Drift Magnitude: sudden drift across 5 delta values.
+
+    Pattern A (baseline): remote + night drive fraud; foreign + velocity = 0.
+    Pattern B (drifted):  foreign + velocity drive fraud; remote + night = 0.
+    delta scales the interpolation fraction A→B (max delta = full swap).
+    """
+    pattern_A, pattern_B = _build_axis12_endpoints(seed)
+    base = pattern_A
+    for delta in deltas:
+        cfg_list = _build_cfg_list_axis12(
+    pattern_A=pattern_A,
+    pattern_B=pattern_B,
+    d=delta,
+    speed="sudden",
+    seed=seed,
+)
+        label = f"axis1_delta{delta}_sudden"
+        print(f"\n{'='*60}\nAxis 1 — delta={delta}  sudden\n{'='*60}")
+        df = generate_multiperiod(cfg_list=cfg_list, cfg=base, seed=seed,
+                                  verbose=True, label=label)
+        _finish_dataset(label, df, {
+            "axis": "axis1", "label": label, "seed": seed,
+            "n_periods": len(cfg_list), "drift_magnitude_d": delta, "speed": "sudden",
+            "period_config": {str(p): "A" if p <= 5 else "B"
+                              for p in range(1, len(cfg_list) + 1)},
+        })
+
+
+# ---------------------------------------------------------------------------
+# Axis 2 — Drift Speed
+# ---------------------------------------------------------------------------
+
+def run_axis2(deltas: List[float] = DELTAS_AXIS2, seed: int = SEED) -> None:
+    """Axis 2 — Gradual Drift: gradual A→B drift across the same delta values.
+
+    Pattern A: remote + night drive fraud.
+    Pattern B: foreign + velocity drive fraud.
+    The drift is introduced gradually over periods 1–10.
+    """
+    pattern_A, pattern_B = _build_axis12_endpoints(seed)
+    base = pattern_A
+
+    for delta in deltas:
+        speed = "gradual"
+
+        cfg_list = _build_cfg_list_axis12(
+            pattern_A=pattern_A,
+            pattern_B=pattern_B,
+            d=delta,
+            speed=speed,
+            seed=seed,
+        )
+
+        label = f"axis2_delta{delta}_gradual"
+
+        print(f"\n{'='*60}\nAxis 2 — delta={delta}  {speed}\n{'='*60}")
+
+        df = generate_multiperiod(
+            cfg_list=cfg_list,
+            cfg=base,
+            seed=seed,
+            verbose=True,
+            label=label,
+        )
+
+        _finish_dataset(label, df, {
+            "axis": "axis2",
+            "label": label,
+            "seed": seed,
+            "n_periods": len(cfg_list),
+            "drift_magnitude_d": delta,
+            "speed": speed,
+            "period_config": {
+                str(p): "gradual_A_to_B"
+                for p in range(1, len(cfg_list) + 1)
+            },
+        })
+
+
+# ---------------------------------------------------------------------------
+# Axis 3 — Freeze Duration
+# ---------------------------------------------------------------------------
+
+FREEZE_DURATIONS = [1, 2, 3, 4, 5, 6]
+
+
+def run_axis3(freeze_durations: List[int] = FREEZE_DURATIONS, seed: int = SEED) -> None:
+
+
+    n_total = 10  # 3 baseline + up to 6 frozen + at least 1 recovery = 10
+    n_baseline = 3
+    for k in freeze_durations:
+        base = calibrate_intercept(GeneratorConfig(), target_rate=0.01, seed=seed)
+        frozen = replace(base, fraud_intercept=-50.0)
+
+        cfg_list: List[GeneratorConfig] = []
+        period_config: Dict[str, str] = {}
+        for p in range(1, n_total + 1):
+            if p <= n_baseline:
+                cfg_list.append(base);   period_config[str(p)] = "baseline"
+            elif p <= n_baseline + k:
+                cfg_list.append(frozen); period_config[str(p)] = "frozen"
+            else:
+                cfg_list.append(base);   period_config[str(p)] = "recovery"
+
+        label = f"axis3_freeze_k{k}"
+        print(f"\n{'='*60}\nAxis 3 — freeze_duration k={k}  ({n_total} periods)\n{'='*60}")
+        df = generate_multiperiod(cfg_list=cfg_list, cfg=base, seed=seed,
+                                  verbose=True, label=label)
+        _finish_dataset(label, df, {
+            "axis": "axis3", "label": label, "seed": seed,
+            "n_periods": n_total, "freeze_duration_k": k,
+            "freeze_intercept": -50.0,
+            "baseline_intercept": float(base.fraud_intercept),
+            "period_config": period_config,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Axis 4 — Freeze Depth
+# ---------------------------------------------------------------------------
+
+FREEZE_OFFSETS = [0.2, 1.0, 2.0, 4.0, 8.0, 40.0]
+
+
+def run_axis4(offsets: List[float] = FREEZE_OFFSETS, seed: int = SEED) -> None:
+    """Axis 4 — Freeze Depth: varying fraud suppression intensity.
+
+    Freeze intercepts are defined relative to the calibrated baseline intercept:
+    alpha_freeze = alpha_baseline - offset.
+    Larger offsets imply stronger fraud suppression.
+    """
+    base = calibrate_intercept(GeneratorConfig(), target_rate=0.01, seed=seed)
+
+    for offset in offsets:
+        freeze_alpha = base.fraud_intercept - offset
+        frozen = replace(base, fraud_intercept=freeze_alpha)
+
+        cfg_list: List[GeneratorConfig] = []
+        period_config: Dict[str, str] = {}
+
+        for p in range(1, 11):
+            if p <= 4:
+                cfg_list.append(base)
+                period_config[str(p)] = "baseline"
+            elif p <= 7:
+                cfg_list.append(frozen)
+                period_config[str(p)] = "frozen"
+            else:
+                cfg_list.append(base)
+                period_config[str(p)] = "recovery"
+
+        label = f"axis4_offset{offset}"
+
+        print(f"\n{'='*60}\nAxis 4 — freeze_offset={offset}, freeze_alpha={freeze_alpha:.4f}\n{'='*60}")
+
+        df = generate_multiperiod(
+            cfg_list=cfg_list,
+            cfg=base,
+            seed=seed,
+            verbose=True,
+            label=label,
+        )
+
+        _finish_dataset(label, df, {
+            "axis": "axis4",
+            "label": label,
+            "seed": seed,
+            "n_periods": 10,
+            "freeze_offset": offset,
+            "freeze_intercept_alpha": float(freeze_alpha),
+            "baseline_intercept": float(base.fraud_intercept),
+            "period_config": period_config,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Axis 5 — Pattern Rotation
+# ---------------------------------------------------------------------------
+
+def _build_axis5_patterns(seed: int) -> Dict[str, GeneratorConfig]:
+    """Axis 5 patterns with non-focus weights kept near zero, not exactly zero."""
+
+    # Pattern A — remote/night-focused
+    pattern_A = calibrate_intercept(replace(GeneratorConfig(),
+        w_amount=0.50,
+        w_night=3.00,
+        w_foreign=0.15,
+        w_velocity_1h=0.15,
+        w_velocity_24h=0.15,
+        w_gap_short=0.15,
+        w_remote=3.00,
+        w_remote_x_foreign=0.10,
+        w_remote_x_night=1.00,
+        w_velocity_x_gap=0.10,
+    ), target_rate=0.01, seed=seed)
+
+    # Pattern B — velocity/foreign-focused
+    pattern_B = calibrate_intercept(replace(GeneratorConfig(),
+        w_amount=0.50,
+        w_night=0.15,
+        w_foreign=3.00,
+        w_velocity_1h=3.00,
+        w_velocity_24h=2.00,
+        w_gap_short=1.50,
+        w_remote=0.15,
+        w_remote_x_foreign=0.10,
+        w_remote_x_night=0.10,
+        w_velocity_x_gap=1.50,
+    ), target_rate=0.01, seed=seed)
+
+    # Pattern C — high-amount/night-focused
+    pattern_C = calibrate_intercept(replace(GeneratorConfig(),
+        w_amount=4.00,
+        w_night=3.50,
+        w_foreign=0.50,
+        w_velocity_1h=0.15,
+        w_velocity_24h=0.15,
+        w_gap_short=0.15,
+        w_remote=1.00,
+        w_remote_x_foreign=0.10,
+        w_remote_x_night=1.50,
+        w_velocity_x_gap=0.10,
+    ), target_rate=0.01, seed=seed)
+
+    return {"A": pattern_A, "B": pattern_B, "C": pattern_C}
+
+_ROTATION_SCHEDULE = {
+    1: "A", 2: "A", 3: "B", 4: "B", 5: "C",
+    6: "C", 7: "A", 8: "A", 9: "B", 10: "B",
+}
+
+def run_axis5(seed: int = SEED) -> None:
+    patterns = _build_axis5_patterns(seed)
+    base = patterns["A"]
+
+    cfg_list = [patterns[_ROTATION_SCHEDULE[p]] for p in range(1, 11)]
+
+    label = "axis5_pattern_rotation"
+
+    print(f"\n{'='*60}\nAxis 5 — Pattern Rotation\n{'='*60}")
+
+    df = generate_multiperiod(
+        cfg_list=cfg_list,
+        cfg=base,
+        seed=seed,
+        verbose=True,
+        label=label
+    )
+
+    df["active_pattern"] = df["period"].map(_ROTATION_SCHEDULE)
+
+    _finish_dataset(label, df, {
+        "axis": "axis5",
+        "label": label,
+        "seed": seed,
+        "rotation_schedule": _ROTATION_SCHEDULE,
+    })
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    np.random.seed(SEED)
+    run_baseline()
+    run_axis1()
+    run_axis2()
+    run_axis3()
+    run_axis4()
+    run_axis5()
+
 
 if __name__ == "__main__":
-    import os
-    from dataclasses import replace
-
-    out = r"C:\Users\julie\OneDrive\Documenten\Thesis\outputs"
-    os.makedirs(out, exist_ok=True)
-
-    N    = 10
-    base = GeneratorConfig()
-
-    # Full-drift target weights (100% = this destination)
-    W_START = dict(w_remote=1.4, w_velocity_1h=0.9, w_amount=0.7,
-                   w_foreign=1.3, w_night=0.6)
-    W_END   = dict(w_remote=2.5, w_velocity_1h=2.0, w_amount=1.5,
-                   w_foreign=0.4, w_night=0.1)
-
-    def scaled_cfg(scale):
-        """Config where weights moved `scale` fraction toward W_END."""
-        return replace(base,
-            w_remote      = round(W_START["w_remote"]      + scale*(W_END["w_remote"]      - W_START["w_remote"]),      4),
-            w_velocity_1h = round(W_START["w_velocity_1h"] + scale*(W_END["w_velocity_1h"] - W_START["w_velocity_1h"]), 4),
-            w_amount      = round(W_START["w_amount"]       + scale*(W_END["w_amount"]      - W_START["w_amount"]),      4),
-            w_foreign     = round(W_START["w_foreign"]      + scale*(W_END["w_foreign"]     - W_START["w_foreign"]),     4),
-            w_night       = round(W_START["w_night"]        + scale*(W_END["w_night"]       - W_START["w_night"]),       4),
-        )
-
-    def gradual_list(scale, n_periods):
-        """Linear ramp from baseline (p1) to scaled_cfg (p_n)."""
-        return [
-            scaled_cfg(scale * (p-1) / (n_periods-1))
-            for p in range(1, n_periods+1)
-        ]
-
-    saved = []
-
-    # -------------------------------------------------------------------
-    # 0. BASELINE
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print("  0. BASELINE — stationary reference")
-    print("="*72)
-    df = generate_multiperiod(cfg_list=[base]*N, seed=42, verbose=True,
-                               label="Baseline")
-    fname = "drift_baseline.csv"
-    df.to_csv(f"{out}/{fname}", index=False)
-    saved.append(fname)
-    print(f"  -> fraud={df['is_fraud'].mean()*100:.3f}%")
-
-    # -------------------------------------------------------------------
-    # AXIS 1 — DRIFT MAGNITUDE (16 steps, sudden)
-    # Fine-grained at low end to capture the break point precisely
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print("  AXIS 1 — DRIFT MAGNITUDE (sudden, 16 steps)")
-    print("  Periods 1-5: baseline.  Periods 6-10: drifted.")
-    print("="*72)
-
-    magnitude_steps = [
-        0.10, 0.20, 0.30, 0.40, 0.50,   # fine: 10-50%  (where break likely is)
-        0.60, 0.75, 0.90, 1.00,           # medium: 60-100%
-        1.20, 1.40, 1.60, 1.80,           # large: 120-180%
-        2.00, 2.25, 2.50,                 # extreme: 200-250%
-    ]
-
-    for scale in magnitude_steps:
-        post = scaled_cfg(scale)
-        pct  = int(round(scale * 100))
-        df = generate_multiperiod(
-            cfg_list=[base]*5 + [post]*5,
-            seed=42, verbose=True,
-            label=f"Sudden {pct}%"
-        )
-        fname = f"drift_sudden_mag{pct:03d}pct.csv"
-        df.to_csv(f"{out}/{fname}", index=False)
-        saved.append(fname)
-        pre = df[df.period<=5]["is_fraud"].mean()*100
-        pst = df[df.period>5 ]["is_fraud"].mean()*100
-        print(f"  -> {pct:3d}%  pre={pre:.3f}%  post={pst:.3f}%")
-
-    # -------------------------------------------------------------------
-    # AXIS 2 — DRIFT SPEED (sudden vs gradual, 4 magnitudes)
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print("  AXIS 2 — DRIFT SPEED (sudden vs gradual, 4 magnitudes)")
-    print("="*72)
-
-    speed_pairs = [
-        (0.50, "mag050pct"),
-        (1.00, "mag100pct"),
-        (1.50, "mag150pct"),
-        (2.00, "mag200pct"),
-    ]
-
-    for scale, slabel in speed_pairs:
-        post = scaled_cfg(scale)
-
-        # Sudden
-        df = generate_multiperiod(
-            cfg_list=[base]*5 + [post]*5,
-            seed=42, verbose=True,
-            label=f"Speed sudden {int(scale*100)}%"
-        )
-        fname = f"drift_speed_sudden_{slabel}.csv"
-        df.to_csv(f"{out}/{fname}", index=False)
-        saved.append(fname)
-        print(f"  sudden {int(scale*100)}%: "
-              f"pre={df[df.period<=5]['is_fraud'].mean()*100:.3f}%  "
-              f"post={df[df.period>5]['is_fraud'].mean()*100:.3f}%")
-
-        # Gradual — same destination
-        df = generate_multiperiod(
-            cfg_list=gradual_list(scale, N),
-            seed=42, verbose=True,
-            label=f"Speed gradual {int(scale*100)}%"
-        )
-        fname = f"drift_speed_gradual_{slabel}.csv"
-        df.to_csv(f"{out}/{fname}", index=False)
-        saved.append(fname)
-        print(f"  gradual {int(scale*100)}%: "
-              f"p1={df[df.period==1]['is_fraud'].mean()*100:.3f}%  "
-              f"p10={df[df.period==10]['is_fraud'].mean()*100:.3f}%")
-
-    # -------------------------------------------------------------------
-    # AXIS 3 — FREEZE DURATION (1 to 7 frozen periods from period 3)
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print("  AXIS 3 — FREEZE DURATION (1 to 7 periods, starting at period 3)")
-    print("="*72)
-
-    frozen_deep = replace(base, fraud_intercept=-50.0)
-
-    # Periods 1-4: baseline (model learns fraud patterns)
-    # Periods 5 to 5+k-1: frozen (fraud disappears)
-    # Periods 5+k to 10: baseline returns (does model remember?)
-    # Max k = 6 so there is always at least 1 recovery period
-    for k in range(1, 7):
-        cfg_list = [base]*4 + [frozen_deep]*k + [base]*(N-4-k)
-        assert len(cfg_list) == N, f"length {len(cfg_list)} != {N}"
-        df = generate_multiperiod(
-            cfg_list=cfg_list, seed=42, verbose=True,
-            label=f"Freeze duration {k}p (p5-p{4+k} frozen, baseline resumes p{5+k})"
-        )
-        fname = f"drift_freeze_duration_{k}p.csv"
-        df.to_csv(f"{out}/{fname}", index=False)
-        saved.append(fname)
-        fr = df[df.period.isin(range(5, 5+k))]["is_fraud"].mean()*100
-        po = df[df.period >= 5+k]["is_fraud"].mean()*100
-        print(f"  {k}p frozen (p5-p{4+k}) -> freeze={fr:.4f}%  post-freeze={po:.3f}%")
-
-    # -------------------------------------------------------------------
-    # AXIS 4 — FREEZE DEPTH (6 levels, always 3 frozen periods)
-    # How much suppression is needed before models forget?
-    # intercept goes from -14 (mild) to -50 (near-zero fraud)
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print("  AXIS 4 — FREEZE DEPTH (3 frozen periods p5-p7, 6 suppression levels)")
-    print("  Structure: 4 normal | 3 frozen | 3 normal")
-    print(f"  Baseline intercept = {base.fraud_intercept}")
-    print("="*72)
-
-    freeze_intercepts = [-14.0, -16.0, -18.0, -20.0, -30.0, -50.0]
-
-    # Same 3-period freeze, always periods 5-7
-    # Periods 1-4: baseline, periods 5-7: frozen at varying depth,
-    # periods 8-10: baseline returns
-    for intercept in freeze_intercepts:
-        frozen_shallow = replace(base, fraud_intercept=intercept)
-        cfg_list = [base]*4 + [frozen_shallow]*3 + [base]*3
-        assert len(cfg_list) == N
-        df = generate_multiperiod(
-            cfg_list=cfg_list, seed=42, verbose=True,
-            label=f"Freeze depth intercept={intercept} (p5-p7 frozen)"
-        )
-        label_int = str(intercept).replace("-","neg").replace(".","p")
-        fname = f"drift_freeze_depth_{label_int}.csv"
-        df.to_csv(f"{out}/{fname}", index=False)
-        saved.append(fname)
-        fr = df[df.period.isin([5,6,7])]["is_fraud"].mean()*100
-        po = df[df.period >= 8]["is_fraud"].mean()*100
-        print(f"  intercept={intercept:6.1f} -> freeze={fr:.4f}%  post={po:.3f}%")
-
-    # -------------------------------------------------------------------
-    # AXIS 5 — FRAUD PATTERN ROTATION
-    # 4 named fraud patterns, each active for 3 periods.
-    # Pattern A is the baseline. B, C, D are distinct fraud types
-    # that each move weights in a different direction from baseline.
-    # After cycling through B, C, D the fraudsters return to A.
-    # Question: has the model forgotten Pattern A?
-    #
-    # Pattern A — baseline (CNP moderate, cross-border moderate)
-    # Pattern B — CNP surge:     w_remote ↑, w_velocity_1h ↑, w_foreign ↓, w_night ↓
-    # Pattern C — cross-border:  w_foreign ↑, w_new_country ↑, w_remote ↓, w_night ↑
-    # Pattern D — burst/amount:  w_velocity_1h ↑, w_amount ↑, w_remote ↓, w_foreign ↓
-    #
-    # Sensitivity: scale how far B, C, D deviate from A.
-    # Structure (12 periods): A,A,A | B,B,B | C,C,C | A,A,A (return)
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print("  AXIS 5 — FRAUD PATTERN ROTATION (A→B→C→A→B, 10 periods)")
-    print("  2 periods per pattern. Sensitivity = how different patterns are.")
-    print("  Pattern A: baseline.  B: CNP surge.  C: cross-border.")
-    print("  Return to A at period 7-8, B at period 9-10 — does the model still recognise them?")
-    print("="*72)
-
-    N_ROT = 10   # 10 periods: 2 per pattern × 5 blocks (A, B, C, A, B)
-
-    # Direction vectors for each pattern relative to baseline
-    # Includes both main effect weights AND interaction weights
-    # Pattern B (CNP surge): strong remote×foreign and remote×night interactions
-    # Pattern C (cross-border): strong newcountry×foreign interaction, no remote
-    PATTERN_B_DIR = dict(
-        w_remote=+1.1, w_velocity_1h=+1.1, w_amount=+0.8,
-        w_foreign=-0.9, w_night=-0.5, w_new_country=-0.2,
-        # CNP surge activates remote interactions strongly
-        w_remote_x_foreign=+0.7, w_remote_x_night=+0.6,
-        w_velocity_x_gap=+0.5,   w_newcountry_x_foreign=-0.3,
-    )
-    PATTERN_C_DIR = dict(
-        w_remote=-0.6, w_velocity_1h=-0.3, w_amount=+0.3,
-        w_foreign=+1.0, w_night=+0.8, w_new_country=+0.8,
-        # Cross-border activates geographic novelty interactions
-        w_remote_x_foreign=-0.4, w_remote_x_night=-0.2,
-        w_velocity_x_gap=-0.2,   w_newcountry_x_foreign=+0.9,
-    )
-
-    def pattern_cfg(direction, scale):
-        """Return a config shifted in `direction` by `scale` from baseline."""
-        return replace(base,
-            w_remote      = round(max(0.01, base.w_remote      + scale * direction.get("w_remote",      0)), 4),
-            w_velocity_1h = round(max(0.01, base.w_velocity_1h + scale * direction.get("w_velocity_1h", 0)), 4),
-            w_amount      = round(max(0.01, base.w_amount       + scale * direction.get("w_amount",      0)), 4),
-            w_foreign     = round(max(0.01, base.w_foreign      + scale * direction.get("w_foreign",     0)), 4),
-            w_night       = round(max(0.01, base.w_night        + scale * direction.get("w_night",       0)), 4),
-            w_new_country = round(max(0.01, base.w_new_country  + scale * direction.get("w_new_country", 0)), 4),
-            # Interaction weights also shift per pattern
-            w_remote_x_foreign    = round(max(0.0, base.w_remote_x_foreign    + scale * direction.get("w_remote_x_foreign",    0)), 4),
-            w_remote_x_night      = round(max(0.0, base.w_remote_x_night      + scale * direction.get("w_remote_x_night",      0)), 4),
-            w_velocity_x_gap      = round(max(0.0, base.w_velocity_x_gap      + scale * direction.get("w_velocity_x_gap",      0)), 4),
-            w_newcountry_x_foreign= round(max(0.0, base.w_newcountry_x_foreign+ scale * direction.get("w_newcountry_x_foreign", 0)), 4),
-        )
-
-    rotation_scales = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 2.50]
-
-    for scale in rotation_scales:
-        pat_A = base                              # Pattern A: always baseline
-        pat_B = pattern_cfg(PATTERN_B_DIR, scale) # CNP surge
-        pat_C = pattern_cfg(PATTERN_C_DIR, scale) # cross-border
-
-        # A,A | B,B | C,C | A,A | B,B
-        cfg_list = [pat_A]*2 + [pat_B]*2 + [pat_C]*2 + [pat_A]*2 + [pat_B]*2
-        assert len(cfg_list) == N_ROT
-
-        pct = int(round(scale * 100))
-        df = generate_multiperiod(
-            cfg_list=cfg_list, seed=42, verbose=True,
-            label=f"Rotation {pct}% — A(p1-2) B(p3-4) C(p5-6) A-return(p7-8) B-return(p9-10)"
-        )
-        fname = f"drift_rotation_{pct:03d}pct.csv"
-        df.to_csv(f"{out}/{fname}", index=False)
-        saved.append(fname)
-
-        # Key comparison: Pattern A and B fraud rates at start vs at return
-        fr_A_start  = df[df.period.isin([1,2])]["is_fraud"].mean()*100
-        fr_B        = df[df.period.isin([3,4])]["is_fraud"].mean()*100
-        fr_C        = df[df.period.isin([5,6])]["is_fraud"].mean()*100
-        fr_A_return = df[df.period.isin([7,8])]["is_fraud"].mean()*100
-        fr_B_return = df[df.period.isin([9,10])]["is_fraud"].mean()*100
-        print(f"  {pct:3d}%  A-start={fr_A_start:.3f}%  B={fr_B:.3f}%  "
-              f"C={fr_C:.3f}%  A-return={fr_A_return:.3f}%  B-return={fr_B_return:.3f}%")
-
-    # -------------------------------------------------------------------
-    # SUMMARY
-    # -------------------------------------------------------------------
-    print("\n" + "="*72)
-    print(f"  DONE — {len(saved)} datasets")
-    print("="*72)
-
-    axis1 = [f for f in saved if "sudden_mag" in f]
-    axis2 = [f for f in saved if "speed" in f]
-    axis3 = [f for f in saved if "duration" in f]
-    axis4 = [f for f in saved if "depth" in f]
-    axis5 = [f for f in saved if "rotation" in f]
-
-    print(f"\n  Axis 1 — magnitude  : {len(axis1):2d} datasets  (drift_sudden_magXXXpct.csv)")
-    print(f"  Axis 2 — speed      : {len(axis2):2d} datasets  (drift_speed_sudden/gradual_magXXXpct.csv)")
-    print(f"  Axis 3 — freeze dur.: {len(axis3):2d} datasets  (drift_freeze_duration_Np.csv)")
-    print(f"  Axis 4 — freeze dep.: {len(axis4):2d} datasets  (drift_freeze_depth_*.csv)")
-    print(f"  Axis 5 — rotation   : {len(axis5):2d} datasets  (drift_rotation_XXXpct.csv)")
-    print(f"  Baseline            :  1 dataset   (drift_baseline.csv)")
-    print(f"  ─────────────────────────────────────────────")
-    print(f"  Total               : {len(saved):2d} datasets\n")
-    print(f"  Output: {out}\n")
-    print("""  HOW TO USE FOR YOUR THESIS:
-  Axis 1: x = drift magnitude,      y = avg PR-AUC + forgetting → break point
-  Axis 2: sudden vs gradual lines,   y = avg PR-AUC + forgetting → does speed matter?
-  Axis 3: x = freeze duration,       y = post-freeze avg PR-AUC  → how fast do models forget?
-  Axis 4: x = freeze depth,          y = post-freeze avg PR-AUC  → does partial quiet matter?
-  Axis 5: x = pattern separation,    y = avg PR-AUC on A-return  → does rotation fool the model?
-  A bank can locate their scenario on these curves and read off which CL method survives.
-""")
+    main()
