@@ -20,7 +20,7 @@ OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 @dataclass
 class GeneratorConfig:
     # Population
-    n_customers:              int   = 1000
+    n_customers:              int   = 10000
     txns_per_customer_lambda: float = 10.0
 
     # Transaction amounts (log-normal, personal offsets)
