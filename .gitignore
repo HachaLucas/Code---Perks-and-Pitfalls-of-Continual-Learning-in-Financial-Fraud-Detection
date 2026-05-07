@@ -1,0 +1,40 @@
+# --- Byte-compiled / optimized / DLL files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Distribution / packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Environments ---
+.env
+.venv/
+venv/
+env/
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Project-specific ---
+# Datasets are typically too large for git -- keep the folder, ignore the CSVs.
+data/raw/*.csv
+data/processed/*.csv
+
+# Results / checkpoints / figures should not be committed.
+res/experiment_results/
+res/Thesis Figures/
+
+# The original CSV folder, if dropped into the repo root.
+Thesis Test Datasets/

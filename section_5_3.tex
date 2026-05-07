@@ -1,0 +1,6 @@
+\subsection{Comparing Method Families Across Drift Conditions}
+\label{sec:method-families}
+
+The preceding sections examined each drift axis in isolation, tracing how individual methods respond as a single drift parameter increases. This section reverses the perspective. Rather than asking how a given axis affects each method, we now ask how each \textit{method family} behaves across the full set of drift conditions. The three families follow the taxonomy introduced in Section~\ref{sec:cl-methods}: regularisation-based methods (EWC, SI), memory-based methods (Replay, Full Replay, DER++), and parameter isolation (PackNet). Naive serves as an unprotected baseline throughout.
+
+To support this comparison, Figure~\ref{fig:family-heatmap} presents two heatmaps that summarise the complete experiment in a single view. Each cell reports the mean over all datasets within one axis, aggregating over the drift-parameter values used in that axis. The left panel shows AvgPR; the right panel shows ForgetPR. Reading the figure row by row reveals the characteristic profile of each method across drift conditions; reading it column by column recovers the per-axis patterns discussed in Section~\ref{sec:drift-effect}, but now makes cross-method structure immediately visible.
