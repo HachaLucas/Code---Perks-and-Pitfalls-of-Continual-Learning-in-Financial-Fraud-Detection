@@ -17,7 +17,7 @@ Methods compared:
 - **DER++** — Dark Experience Replay with hard-label anchor.
 
 Datasets are organised along six "axes" of drift (baseline, sudden,
-gradual, freeze, offset, pattern rotation).
+incremental, freeze, offset, pattern rotation).
 
 ## Project layout
 
@@ -54,7 +54,7 @@ gradual, freeze, offset, pattern rotation).
 │       ├── checkpoints.py  npy save/load helpers (used by runner + demo).
 │       └── seeding.py      Reproducibility helper.
 ├── .gitignore
-├── LICENSE                 MIT, © 2026 Lucas Hacha.
+├── LICENSE                 
 ├── README.md
 └── requirements.txt
 ```
