@@ -26,6 +26,7 @@ env/
 # --- OS ---
 .DS_Store
 Thumbs.db
+*.lnk
 
 # --- Project-specific ---
 # Datasets are typically too large for git -- keep the folder, ignore the CSVs.
@@ -34,7 +35,9 @@ data/processed/*.csv
 
 # Results / checkpoints / figures should not be committed.
 res/experiment_results/
+res/figures/
 res/Thesis Figures/
+res/Test_EWC_Map/
 
 # The original CSV folder, if dropped into the repo root.
 Thesis Test Datasets/

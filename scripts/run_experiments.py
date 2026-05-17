@@ -81,12 +81,12 @@ def build_datasets(base_dir: Path) -> dict:
         "axis1_delta1.2_sudden": {"path": base_dir / "axis1_delta1.2_sudden.csv", "axis": 1, "label": "Sudden δ=1.2", "scale": 1.2},
         "axis1_delta1.5_sudden": {"path": base_dir / "axis1_delta1.5_sudden.csv", "axis": 1, "label": "Sudden δ=1.5", "scale": 1.5},
 
-        # AXIS 2: DRIFT MAGNITUDE GRADUAL — 5 datasets
-        "axis2_delta0.3_gradual": {"path": base_dir / "axis2_delta0.3_gradual.csv", "axis": 2, "label": "Gradual δ=0.3", "scale": 0.3},
-        "axis2_delta0.6_gradual": {"path": base_dir / "axis2_delta0.6_gradual.csv", "axis": 2, "label": "Gradual δ=0.6", "scale": 0.6},
-        "axis2_delta0.9_gradual": {"path": base_dir / "axis2_delta0.9_gradual.csv", "axis": 2, "label": "Gradual δ=0.9", "scale": 0.9},
-        "axis2_delta1.2_gradual": {"path": base_dir / "axis2_delta1.2_gradual.csv", "axis": 2, "label": "Gradual δ=1.2", "scale": 1.2},
-        "axis2_delta1.5_gradual": {"path": base_dir / "axis2_delta1.5_gradual.csv", "axis": 2, "label": "Gradual δ=1.5", "scale": 1.5},
+        # AXIS 2: DRIFT MAGNITUDE INCREDMENTAL — 5 datasets
+        "axis2_delta0.3_incremental": {"path": base_dir / "axis2_delta0.3_incremental.csv", "axis": 2, "label": "Incremental δ=0.3", "scale": 0.3},
+        "axis2_delta0.6_incremental": {"path": base_dir / "axis2_delta0.6_incremental.csv", "axis": 2, "label": "Incremental δ=0.6", "scale": 0.6},
+        "axis2_delta0.9_incremental": {"path": base_dir / "axis2_delta0.9_incremental.csv", "axis": 2, "label": "Incremental δ=0.9", "scale": 0.9},
+        "axis2_delta1.2_incremental": {"path": base_dir / "axis2_delta1.2_incremental.csv", "axis": 2, "label": "Incremental δ=1.2", "scale": 1.2},
+        "axis2_delta1.5_incremental": {"path": base_dir / "axis2_delta1.5_incremental.csv", "axis": 2, "label": "Incremental δ=1.5", "scale": 1.5},
 
         # AXIS 3: FREEZE DURATION — 6 datasets
         "axis3_freeze_k1": {"path": base_dir / "axis3_freeze_k1.csv", "axis": 3, "label": "Freeze k=1", "k": 1},
@@ -230,16 +230,21 @@ def _run_packnet(loader, cfg) -> tuple[np.ndarray, np.ndarray]:
 
     for task_id in range(n_tasks):
         X_train, y_train = loader.get_data_for_task(task_id, "train")
-        model = train_with_packnet(model, X_train, y_train, frozen_mask,
-                                   epochs=cfg["n_epochs"], lr=cfg["learning_rate"])
-        frozen_mask = apply_pruning_and_update_mask(
-            model, frozen_mask, prune_ratio=cfg["packnet_prune_ratio"]
+
+        model = train_with_packnet(
+            model, X_train, y_train, frozen_mask,
+            epochs=cfg["n_epochs"],
+            lr=cfg["learning_rate"]
         )
         for test_id in range(task_id + 1):
             X_test, y_test = loader.get_data_for_task(test_id, "test")
             m = test_on_task(model, X_test, y_test)
             acc[task_id, test_id] = m["acc"]
             pr[task_id, test_id] = m["pr_auc"]
+        frozen_mask = apply_pruning_and_update_mask(
+            model, frozen_mask, prune_ratio=cfg["packnet_prune_ratio"]
+        )
+
     return acc, pr
 
 

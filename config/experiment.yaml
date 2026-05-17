@@ -16,34 +16,34 @@ learning_rate: 0.01     # Adam learning rate
 
 # Method-specific hyperparameters --------------------------------------
 memory_size: 100000      # Replay buffer capacity
-ewc_lambda: 250          # EWC penalty strength
+ewc_lambda: 10           # EWC penalty strength
 fisher_samples: 1000     # Samples used for diagonal Fisher estimation (EWC)
 packnet_prune_ratio: 0.9 # Fraction of FREE weights pruned after each task
-si_lambda: 500           # Synaptic Intelligence penalty strength
+si_lambda: 100           # Synaptic Intelligence penalty strength
 si_xi: 0.01              # SI damping term (xi)
 der_alpha: 0.5           # DER++ dark-knowledge distillation weight
 der_beta: 0.5            # DER++ hard-label replay weight
 
 # Methods to run -------------------------------------------------------
 run_methods:
-  naive:       true
-  replay:      true
-  ewc:         true
+  naive:       false
+  replay:      false
+  ewc:         false
   packnet:     true
-  full_replay: true
-  si:          true
-  der:         true
+  full_replay: false
+  si:          false
+  der:         false
 
 # Axes to run ----------------------------------------------------------
 # Axis mapping:
 #   0 = Baseline (1 dataset)
 #   1 = Drift Magnitude Sudden (5 datasets)
-#   2 = Drift Magnitude Gradual (5 datasets)
+#   2 = Drift Magnitude incremental (5 datasets)
 #   3 = Freeze Duration (6 datasets)
 #   4 = Offset (6 datasets)
 #   5 = Pattern Rotation (1 dataset)
 # Set to null to run all 44 datasets, or a list like [0, 1, 2, 3, 4, 5].
-run_axes: [0, 1, 2, 3, 4, 5]
+run_axes: [1]
 
 # Metrics to display in the runner -------------------------------------
 show_metrics:
@@ -55,6 +55,6 @@ show_metrics:
 
 # Paths (relative to project root) -------------------------------------
 paths:
-  base_dir: "Thesis Test Datasets"   # Folder containing all CSV datasets
+  base_dir: "data"                        # Folder containing all CSV datasets
   results_dir: "res/experiment_results"   # Where checkpoints (npy) are saved
-  figures_dir: "res/Thesis Figures"       # Where visualisations are saved
+  figures_dir: "res/figures"              # Where visualisations are saved

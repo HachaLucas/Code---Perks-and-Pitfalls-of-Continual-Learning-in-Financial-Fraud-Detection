@@ -29,7 +29,7 @@ class EWC:
         self.task_params: list[dict[str, torch.Tensor]] = []
         self.task_fishers: list[dict[str, torch.Tensor]] = []
 
-    def update(self, model, dataset, fisher_samples: int = 500) -> None:
+    def update(self, model, dataset, fisher_samples: int = 1000) -> None:
         """
         Compute the diagonal Fisher for the just-trained task and store it
         together with a snapshot of the current parameters.

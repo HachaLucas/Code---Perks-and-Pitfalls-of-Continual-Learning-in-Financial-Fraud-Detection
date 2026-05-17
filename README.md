@@ -34,7 +34,7 @@ incremental, freeze, offset, pattern rotation).
 │   └── demo.ipynb          Slim demo: load config + run one method.
 ├── res/
 │   ├── experiment_results/ .npy checkpoints per (dataset, method).
-│   └── Thesis Figures/     Generated figures.
+│   └── figures/            Generated figures.
 ├── scripts/
 │   └── run_experiments.py  CLI runner — multi-dataset, multi-method.
 ├── src/
@@ -68,8 +68,8 @@ pip install -r requirements.txt
 ```
 
 Drop the dataset CSVs in a folder matching `paths.base_dir` from the
-config (default: `Thesis Test Datasets/` at the project root). Or move
-them to `data/raw/` and update the YAML.
+config (default: `data/` at the project root). Or update
+`paths.base_dir` in the YAML to point to your dataset folder.
 
 ## How to run
 

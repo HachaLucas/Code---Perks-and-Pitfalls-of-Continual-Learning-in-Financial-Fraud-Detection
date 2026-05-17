@@ -18,6 +18,7 @@ Public API:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -37,6 +38,36 @@ METHOD_STYLE: Dict[str, Dict[str, str]] = {
     "si":          {"color": "#8172B2", "label": "SI"},
     "der":         {"color": "#64B5CD", "label": "DER++"},
 }
+
+def _format_ds_label(ds_name: str) -> str:
+    """Convert a raw dataset key to a human-readable title.
+
+    axis1_delta1.5_sudden      -> "Sudden: Delta = 1.5"
+    axis2_delta0.3_incremental -> "Incremental: Delta = 0.3"
+    axis3_freeze_k3            -> "Freeze: k = 3"
+    axis4_offset2.0            -> "Offset: Gamma = 2.0"
+    axis5_pattern_rotation     -> "Pattern Rotation"
+    axis0_baseline             -> "Baseline"
+    """
+    name = re.sub(r"^axis\d+_", "", ds_name)
+    m = re.match(r"delta([\d.]+)_sudden", name)
+    if m:
+        return f"Sudden: Delta = {m.group(1)}"
+    m = re.match(r"delta([\d.]+)_incremental", name)
+    if m:
+        return f"Incremental: Delta = {m.group(1)}"
+    m = re.match(r"freeze_k(\d+)", name)
+    if m:
+        return f"Freeze: k = {m.group(1)}"
+    m = re.match(r"offset([\d.]+)", name)
+    if m:
+        return f"Offset: Gamma = {m.group(1)}"
+    if name == "pattern_rotation":
+        return "Pattern Rotation"
+    if name == "baseline":
+        return "Baseline"
+    return name.replace("_", " ").title()
+
 
 # (label, index in the compute_thesis_metrics tuple)
 METRICS: List[Tuple[str, int]] = [
@@ -150,7 +181,7 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
         methods = _axis_methods(entries)
         _, _, mdict = entries[0]  # only 1 dataset
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        fig.suptitle("Axis 0 — Baseline", fontsize=13, fontweight="bold")
+        fig.suptitle("Baseline", fontsize=13, fontweight="bold")
         for ax, (metric_label, midx) in zip(axes, METRICS[:2]):
             labels, vals, colors = [], [], []
             for m in methods:
@@ -176,7 +207,7 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
         methods = _axis_methods(entries)
         for metric_label, midx in METRICS:
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.set_title(f"Axis 1 — Drift Magnitude | {metric_label}", fontweight="bold")
+            ax.set_title(f"Drift Magnitude | {metric_label}", fontweight="bold")
             for m in methods:
                 xs, ys = [], []
                 for _, info, mdict in entries:
@@ -197,13 +228,13 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
             _save(fig, figures_dir, f"axis1_drift_magnitude_{metric_label}.png")
             plt.close(fig)
 
-    # AXIS 2: Gradual Drift -- line plot (x = delta)
+    # AXIS 2: Incremental Drift -- line plot (x = delta)
     if 2 in axis_groups:
         entries = axis_groups[2]
         methods = _axis_methods(entries)
         for metric_label, midx in METRICS:
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.set_title(f"Axis 2 — Gradual Drift | {metric_label}", fontweight="bold")
+            ax.set_title(f"Incremental Drift | {metric_label}", fontweight="bold")
             for m in methods:
                 xs, ys = [], []
                 for _, info, mdict in sorted(entries, key=lambda t: t[1]["scale"]):
@@ -221,7 +252,7 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
             ax.legend(fontsize=8, ncol=2)
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
-            _save(fig, figures_dir, f"axis2_gradual_drift_{metric_label}.png")
+            _save(fig, figures_dir, f"axis2_incremental_drift_{metric_label}.png")
             plt.close(fig)
 
     # AXIS 3: Freeze Duration -- line plot (x = k)
@@ -230,7 +261,7 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
         methods = _axis_methods(entries)
         for metric_label, midx in METRICS:
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.set_title(f"Axis 3 — Freeze Duration | {metric_label}", fontweight="bold")
+            ax.set_title(f"Freeze Duration | {metric_label}", fontweight="bold")
             for m in methods:
                 xs, ys = [], []
                 for _, info, mdict in entries:
@@ -258,7 +289,7 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
         methods = _axis_methods(entries)
         for metric_label, midx in METRICS:
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.set_title(f"Axis 4 — Offset | {metric_label}", fontweight="bold")
+            ax.set_title(f"Offset | {metric_label}", fontweight="bold")
             for m in methods:
                 xs, ys = [], []
                 for _, info, mdict in entries:
@@ -285,7 +316,7 @@ def plot_per_axis(axis_groups: dict, figures_dir: str | Path) -> None:
         methods = _axis_methods(entries)
         _, _, mdict = entries[0]  # only 1 dataset
         fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        fig.suptitle("Axis 5 — Pattern Rotation", fontsize=13, fontweight="bold")
+        fig.suptitle("Pattern Rotation", fontsize=13, fontweight="bold")
         for ax, (metric_label, midx) in zip(axes, METRICS[:2]):
             labels, vals, colors = [], [], []
             for m in methods:
@@ -314,7 +345,7 @@ def plot_per_axis_heatmaps(axis_groups: dict, figures_dir: str | Path) -> None:
 
     AXIS_CONFIG = {
         1: {"title": "Drift Magnitude", "sort_key": lambda t: t[1]["scale"],  "x_label": "Drift Magnitude (scale)"},
-        2: {"title": "Gradual Drift",   "sort_key": lambda t: t[1]["scale"],  "x_label": "Drift Magnitude (delta)"},
+        2: {"title": "Incremental Drift",   "sort_key": lambda t: t[1]["scale"],  "x_label": "Drift Magnitude (delta)"},
         3: {"title": "Freeze Duration", "sort_key": lambda t: t[1]["k"],      "x_label": "Frozen Periods (k)"},
         4: {"title": "Offset",          "sort_key": lambda t: t[1]["offset"], "x_label": "Offset"},
         5: {"title": "Pattern Rotation","sort_key": lambda t: t[1]["scale"],  "x_label": "Rotation Scale"},
@@ -341,14 +372,15 @@ def plot_per_axis_heatmaps(axis_groups: dict, figures_dir: str | Path) -> None:
             if metric_label == "ForgetPR":
                 abs_max = max(abs(vmin), abs(vmax))
                 vmin_plot, vmax_plot = -abs_max, abs_max
+                cmap = "RdYlGn_r"  # reversed: red = forgetting (positive), green = backward transfer (negative)
             else:
                 vmin_plot, vmax_plot = vmin, vmax
-            cmap = "RdYlGn"
+                cmap = "RdYlGn"
 
             fig_w = max(8, len(x_labels) * 1.0)
             fig_h = max(3, len(methods) * 0.65)
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            ax.set_title(f"Axis {ax_idx} — {cfg['title']} | {metric_label}", fontweight="bold")
+            ax.set_title(f"{cfg['title']} | {metric_label}", fontweight="bold")
 
             im = ax.imshow(mat, cmap=cmap, vmin=vmin_plot, vmax=vmax_plot, aspect="auto")
 
@@ -387,7 +419,7 @@ def plot_method_axis_heatmap(axis_groups: dict, figures_dir: str | Path) -> None
 
     AXIS_LABELS = {
         1: "Drift Mag.\n(Sudden)",
-        2: "Drift Mag.\n(Gradual)",
+        2: "Drift Mag.\n(Incremental)",
         3: "Freeze\nDuration",
         4: "Offset",
         5: "Pattern\nRotation",
@@ -427,16 +459,18 @@ def plot_method_axis_heatmap(axis_groups: dict, figures_dir: str | Path) -> None
         if metric_label == "ForgetPR":
             abs_max = max(abs(vmin), abs(vmax), 1e-6)
             vmin_plot, vmax_plot = -abs_max, abs_max
+            cmap = "RdYlGn_r"  # reversed: red = forgetting (positive)
         else:
             vmin_plot, vmax_plot = vmin, vmax
+            cmap = "RdYlGn"
 
         fig, ax = plt.subplots(figsize=(max(8, len(axes_present) * 1.8), max(4, len(all_methods) * 0.85)))
         ax.set_title(
-            f"Method × Axis — {metric_label}  (mean over datasets per axis)",
+            f"Method × Drift Scenario — {metric_label}  (mean over datasets per drift scenario)",
             fontweight="bold", pad=12,
         )
 
-        im = ax.imshow(mat, cmap="RdYlGn", vmin=vmin_plot, vmax=vmax_plot, aspect="auto")
+        im = ax.imshow(mat, cmap=cmap, vmin=vmin_plot, vmax=vmax_plot, aspect="auto")
 
         for ri in range(len(all_methods)):
             for ci in range(len(axes_present)):
@@ -456,7 +490,7 @@ def plot_method_axis_heatmap(axis_groups: dict, figures_dir: str | Path) -> None
         ax.set_yticklabels(method_labels, fontsize=11)
         ax.set_xlabel("Drift Axis", fontsize=11)
 
-        cbar_label = metric_label + ("  (− = forgetting)" if metric_label == "ForgetPR" else "")
+        cbar_label = metric_label + ("  (+ = forgetting)" if metric_label == "ForgetPR" else "")
         plt.colorbar(im, ax=ax, label=cbar_label, fraction=0.03, pad=0.04)
         plt.tight_layout()
         _save(fig, figures_dir, f"method_axis_heatmap_{metric_label}.png")
@@ -488,7 +522,7 @@ def plot_per_dataset_pr_heatmaps(ds_results: dict, figures_dir: str | Path) -> N
 
             fig, ax = plt.subplots(figsize=(10, 9))
             fig.suptitle(
-                f"PR-AUC Heatmap — {ds_name}\n"
+                f"PR-AUC Heatmap — {_format_ds_label(ds_name)}\n"
                 "Row = after training on task | Column = tested on task | "
                 "Diagonal = peak performance",
                 fontsize=13, fontweight="bold",
@@ -527,8 +561,8 @@ def plot_per_dataset_pr_heatmaps(ds_results: dict, figures_dir: str | Path) -> N
 def plot_per_dataset_forget_pr_heatmaps(ds_results: dict, figures_dir: str | Path) -> None:
     """Per-(dataset, method) ForgetPR heatmaps.
 
-    forget_mat[i, j] = pr_mat[i, j] - pr_mat[j, j]  for i > j (lower triangle).
-    Negative = forgetting, positive = backward transfer.
+    forget_mat[i, j] = pr_mat[j, j] - pr_mat[i, j]  for i > j (lower triangle).
+    Positive = forgetting, negative = backward transfer.
     """
     figures_dir = Path(figures_dir)
     method_order = list(METHOD_STYLE.keys())
@@ -551,22 +585,22 @@ def plot_per_dataset_forget_pr_heatmaps(ds_results: dict, figures_dir: str | Pat
                 for j in range(i):
                     diag_val = pr_mat[j, j]
                     if diag_val > 0 and pr_mat[i, j] > 0:
-                        forget_mat[i, j] = pr_mat[i, j] - diag_val
+                        forget_mat[i, j] = diag_val - pr_mat[i, j]
 
             abs_max = np.nanmax(np.abs(forget_mat)) if not np.all(np.isnan(forget_mat)) else 1.0
             style = METHOD_STYLE.get(method, {"color": "gray", "label": method})
 
             fig, ax = plt.subplots(figsize=(10, 9))
             fig.suptitle(
-                f"ForgetPR Heatmap — {ds_name}\n"
+                f"ForgetPR Heatmap — {_format_ds_label(ds_name)}\n"
                 "Row = after training on task | Column = earlier task | "
-                "Negative = forgetting, Positive = backward transfer",
+                "Positive = forgetting, Negative = backward transfer",
                 fontsize=13, fontweight="bold",
             )
             ax.set_title(style["label"], fontsize=13, fontweight="bold",
                          color=style["color"], pad=12)
 
-            im = ax.imshow(forget_mat, vmin=-abs_max, vmax=abs_max, cmap="RdYlGn", aspect="auto")
+            im = ax.imshow(forget_mat, vmin=-abs_max, vmax=abs_max, cmap="RdYlGn_r", aspect="auto")
 
             for i in range(1, n):
                 for j in range(i):
@@ -581,7 +615,7 @@ def plot_per_dataset_forget_pr_heatmaps(ds_results: dict, figures_dir: str | Pat
             ax.set_yticks(range(n))
             ax.set_xticklabels(task_labels, fontsize=9)
             ax.set_yticklabels(task_labels, fontsize=9)
-            plt.colorbar(im, ax=ax, label="ForgetPR (final − peak)", fraction=0.046, pad=0.04)
+            plt.colorbar(im, ax=ax, label="ForgetPR (peak − final)", fraction=0.046, pad=0.04)
 
             plt.tight_layout()
             _save(fig, figures_dir, f"{ds_name}/{method}_forget_pr_heatmap.png")

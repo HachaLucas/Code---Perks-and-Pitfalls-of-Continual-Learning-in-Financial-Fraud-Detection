@@ -72,18 +72,20 @@ def compute_thesis_metrics(acc_mat: np.ndarray, pr_mat: np.ndarray):
     avg_pr = float(np.nanmean(pr_mat[n_tasks - 1]))  # ignore NaNs
 
     # Forgetting / backward transfer-style metric on accuracy (always defined)
+    # Positive = forgetting (performance dropped), Negative = backward transfer
     forgetting_acc = 0.0
     for t in range(n_tasks - 1):
-        forgetting_acc += acc_mat[n_tasks - 1, t] - acc_mat[t, t]
+        forgetting_acc += acc_mat[t, t] - acc_mat[n_tasks - 1, t]
     avg_forgetting_acc = float(forgetting_acc / (n_tasks - 1))
 
     # Forgetting on PR-AUC (skip undefined comparisons)
+    # Positive = forgetting (performance dropped), Negative = backward transfer
     pr_diffs = []
     for t in range(n_tasks - 1):
         final_val = pr_mat[n_tasks - 1, t]
         diag_val = pr_mat[t, t]
         if not (np.isnan(final_val) or np.isnan(diag_val)):
-            pr_diffs.append(final_val - diag_val)
+            pr_diffs.append(diag_val - final_val)
 
     avg_forgetting_pr = (
         float(np.mean(pr_diffs)) if len(pr_diffs) > 0 else float("nan")
